@@ -167,11 +167,9 @@ class MovyProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val parts = url.split("/")
-        if (parts.size < 2) return null
-        val type = parts[0]
-        val id = parts[1].toIntOrNull() ?: return null
-        if (type != "movie" && type != "tv") return null
+        val match = Regex("(movie|tv)/(\\d+)").find(url) ?: return null
+        val type = match.groupValues[1]
+        val id = match.groupValues[2].toIntOrNull() ?: return null
 
         val detail = runCatching {
             JSONObject(app.get("$DB/$type/$id?append_to_response=external_ids", headers = headers).text)
