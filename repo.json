@@ -1,0 +1,8 @@
+{
+    "name": "Movy",
+    "description": "Movy.sx provider for CloudStream",
+    "manifestVersion": 1,
+    "pluginLists": [
+        "https://raw.githubusercontent.com/HrishikeshBhandarkar/cs-movy/builds/plugins.json"
+    ]
+}
