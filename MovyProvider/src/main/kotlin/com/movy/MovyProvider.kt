@@ -1,6 +1,7 @@
 package com.movy
 
 import com.lagradost.cloudstream3.Episode
+import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
@@ -34,16 +35,20 @@ class MovyProvider : MainAPI() {
     override val hasQuickSearch = true
     override val hasChromecastSupport = true
 
-    override val mainPage = mainPageOf(
-        "$DB/trending/all/day" to "Trending",
-        "$DB/movie/popular" to "Popular Movies",
-        "$DB/tv/popular" to "Popular TV Shows",
-        "$DB/movie/now_playing" to "Now Playing in Theaters",
-        "$DB/discover/tv?with_networks=213" to "Netflix",
-        "$DB/discover/tv?with_networks=2739" to "Disney+",
-        "$DB/discover/tv?with_networks=49" to "HBO",
-        "$DB/movie/top_rated" to "Top Rated Movies",
-        "$DB/tv/top_rated" to "Top Rated TV Shows"
+    override val mainPage = mainPageOf("" to "Home")
+
+    private data class HomeRow(val title: String, val url: String, val type: String? = null)
+
+    private val homeRows = listOf(
+        HomeRow("Trending", "$DB/trending/all/day"),
+        HomeRow("Popular Movies", "$DB/movie/popular", "movie"),
+        HomeRow("Popular TV Shows", "$DB/tv/popular", "tv"),
+        HomeRow("Now Playing in Theaters", "$DB/movie/now_playing", "movie"),
+        HomeRow("Netflix", "$DB/discover/tv?with_networks=213", "tv"),
+        HomeRow("Disney+", "$DB/discover/tv?with_networks=2739", "tv"),
+        HomeRow("HBO", "$DB/discover/tv?with_networks=49", "tv"),
+        HomeRow("Top Rated Movies", "$DB/movie/top_rated", "movie"),
+        HomeRow("Top Rated TV Shows", "$DB/tv/top_rated", "tv")
     )
 
     private val headers = mapOf(
@@ -110,34 +115,27 @@ class MovyProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (request.data.contains("?")) {
-            "${request.data}&page=$page"
-        } else {
-            "${request.data}?page=$page"
+        if (page > 1) return newHomePageResponse(emptyList<HomePageList>())
+
+        val sections = mutableListOf<HomePageList>()
+        for (row in homeRows) {
+            val responseText = runCatching {
+                app.get(row.url, headers = headers).text
+            }.getOrNull() ?: continue
+
+            val results = runCatching { JSONObject(responseText) }.getOrNull()
+                ?.optJSONArray("results") ?: continue
+
+            val items = mutableListOf<SearchResponse>()
+            for (i in 0 until minOf(results.length(), 30)) {
+                val obj = results.optJSONObject(i) ?: continue
+                val item = obj.toSearchResponse(row.type) ?: continue
+                items.add(item)
+            }
+            if (items.isNotEmpty()) sections.add(HomePageList(row.title, items))
         }
 
-        val responseText = runCatching {
-            app.get(url, headers = headers).text
-        }.getOrNull() ?: return newHomePageResponse(request.name, emptyList())
-
-        val results = runCatching { JSONObject(responseText) }.getOrNull()
-            ?.optJSONArray("results")
-            ?: return newHomePageResponse(request.name, emptyList())
-
-        val defaultType = when {
-            request.data.contains("/movie/") || request.data.contains("/movie?") -> "movie"
-            request.data.contains("/tv/") || request.data.contains("/tv?") -> "tv"
-            else -> null
-        }
-
-        val items = mutableListOf<SearchResponse>()
-        for (i in 0 until results.length()) {
-            val obj = results.optJSONObject(i) ?: continue
-            val item = obj.toSearchResponse(defaultType) ?: continue
-            items.add(item)
-        }
-
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        return newHomePageResponse(sections)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
