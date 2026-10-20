@@ -133,7 +133,11 @@ class NetMirrorProvider : MainAPI() {
         return JSONObject(text)
     }
 
-    private fun poster(id: String): String = "https://imgcdn.kim/nf/v/342/$id.jpg"
+    private fun poster(id: String): String = "https://imgcdn.kim/poster/v/$id.jpg"
+
+    private fun widePoster(id: String): String = "https://imgcdn.kim/poster/h/$id.jpg"
+
+    private fun episodePoster(id: String): String = "https://imgcdn.kim/epimg/780/$id.jpg"
 
     private fun card(id: String, title: String, posterUrl: String?): SearchResponse =
         newMovieSearchResponse(title, "$mainUrl/nf/$id", TvType.Movie) {
@@ -176,13 +180,10 @@ class NetMirrorProvider : MainAPI() {
 
         val topTen = document.select("#top10 .top10-post").mapNotNull { element ->
             val id = element.attr("data-post").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val img = element.selectFirst("img")?.let { image ->
-                image.attr("data-src").ifBlank { image.attr("src") }.toString()
-            }
-            card(id, "", img)
+            card(id, "", null)
         }
         if (topTen.isNotEmpty()) {
-            sections.add(HomePageList("Top 10", topTen))
+            sections.add(HomePageList("Top 10", topTen, isHorizontalImages = false))
         }
 
         document.select("div.tray-container").forEach { tray ->
@@ -191,13 +192,10 @@ class NetMirrorProvider : MainAPI() {
             val items = tray.select("article.tray-slide").mapNotNull { article ->
                 val id = article.selectFirst("a[data-post]")?.attr("data-post")
                     ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                val img = article.selectFirst("img")?.let { image ->
-                    image.attr("data-src").ifBlank { image.attr("src") }.toString()
-                }
-                card(id, "", img)
+                card(id, "", null)
             }
             if (items.isNotEmpty()) {
-                sections.add(HomePageList(title, items.take(30)))
+                sections.add(HomePageList(title, items.take(30), isHorizontalImages = false))
             }
         }
 
@@ -276,7 +274,8 @@ class NetMirrorProvider : MainAPI() {
         if (post.optString("type") != "t") {
             return newMovieLoadResponse(title, url, TvType.Movie, description) {
                 this.posterUrl = poster(id)
-                this.backgroundPosterUrl = "https://imgcdn.kim/poster/h/$id.jpg"
+                this.posterHeaders = mapOf("Referer" to "$mainUrl/")
+                this.backgroundPosterUrl = widePoster(id)
                 this.plot = plot
                 this.year = year
                 this.tags = tags
@@ -309,7 +308,7 @@ class NetMirrorProvider : MainAPI() {
                             this.season = item.optString("s").toIntOrNull()
                             this.episode = item.optString("ep").toIntOrNull()
                             this.runTime = item.optString("time").toIntOrNull()
-                            this.posterUrl = "https://imgcdn.kim/nf/v/200/$epId.jpg"
+                            this.posterUrl = episodePoster(epId)
                         }
                     )
                 }
@@ -318,7 +317,8 @@ class NetMirrorProvider : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster(id)
-            this.backgroundPosterUrl = "https://imgcdn.kim/poster/h/$id.jpg"
+            this.posterHeaders = mapOf("Referer" to "$mainUrl/")
+            this.backgroundPosterUrl = widePoster(id)
             this.plot = plot
             this.year = year
             this.tags = tags
@@ -363,7 +363,7 @@ class NetMirrorProvider : MainAPI() {
                         this.season = item.optString("s").toIntOrNull() ?: seasonNumber
                         this.episode = item.optString("ep").toIntOrNull() ?: (i + 1)
                         this.runTime = item.optString("time").toIntOrNull()
-                        this.posterUrl = "https://imgcdn.kim/nf/v/200/$epId.jpg"
+                        this.posterUrl = episodePoster(epId)
                     }
                 )
             }
