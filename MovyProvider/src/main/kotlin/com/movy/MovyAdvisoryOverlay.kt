@@ -9,7 +9,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -18,7 +17,6 @@ import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
-import com.lagradost.cloudstream3.ui.player.PlayerView
 import java.lang.ref.WeakReference
 
 class MovyAdvisoryOverlay private constructor(
@@ -66,8 +64,8 @@ class MovyAdvisoryOverlay private constructor(
         )
     }
 
-    private fun findPlayerView(view: View): PlayerView? {
-        if (view is PlayerView && view.isAttachedToWindow) return view
+    private fun findPlayerView(view: View): ViewGroup? {
+        if (view is ViewGroup && view.isAttachedToWindow && isPlayerView(view)) return view
         if (view is ViewGroup) {
             for (index in view.childCount - 1 downTo 0) {
                 val found = findPlayerView(view.getChildAt(index))
@@ -77,7 +75,21 @@ class MovyAdvisoryOverlay private constructor(
         return null
     }
 
-    private fun attachToPlayer(player: PlayerView, activeSession: Any) {
+    private fun isPlayerView(view: View): Boolean {
+        var type: Class<*>? = view.javaClass
+        while (type != null) {
+            val name = type.name
+            if (name == "com.lagradost.cloudstream3.ui.player.PlayerView" ||
+                name == "androidx.media3.ui.PlayerView"
+            ) {
+                return true
+            }
+            type = type.superclass
+        }
+        return false
+    }
+
+    private fun attachToPlayer(player: ViewGroup, activeSession: Any) {
         if (session !== activeSession) return
         if (card?.parent === player) return
 
@@ -97,7 +109,6 @@ class MovyAdvisoryOverlay private constructor(
         player.addView(root, params)
         card = root
         overlayViews = overlay
-        Log.d(TAG, "Attached demo advisory overlay")
 
         root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(v: View) = Unit
@@ -262,17 +273,17 @@ class MovyAdvisoryOverlay private constructor(
     private fun removeCard(view: View) {
         if (card !== view) return
         cancelAnimations()
-        (view.parent as? ViewGroup)?.removeView(view)
         card = null
         overlayViews = null
+        (view.parent as? ViewGroup)?.removeView(view)
     }
 
     private fun removeExistingCard() {
         val current = card ?: return
-        card = null
         cancelAnimations()
-        (current.parent as? ViewGroup)?.removeView(current)
+        card = null
         overlayViews = null
+        (current.parent as? ViewGroup)?.removeView(current)
     }
 
     private fun cancelAnimations() {
@@ -383,7 +394,6 @@ class MovyAdvisoryOverlay private constructor(
     }
 
     companion object {
-        private const val TAG = "MovyAdvisoryOverlay"
         private const val DELAY_MS = 0L
         private const val EXIT_AT_MS = 4_500L
         private const val CYCLE_MS = 5_220L
