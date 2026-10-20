@@ -23,6 +23,7 @@ Direct `cloudstreamrepo://` link:
 - Movies and TV series with all seasons/episodes
 - Multiple source servers with up to 2160p quality
 - Subtitle support
+- Demo Netflix-style content advisory badge in the player
 - No account or login required
 
 ## Development
