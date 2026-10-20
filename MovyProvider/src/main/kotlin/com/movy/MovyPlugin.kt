@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.plugins.Plugin
 class MovyPlugin : Plugin() {
     override fun load(context: Context) {
         NetMirrorStore.init(context)
+        NetMirrorSettings.init(context)
         registerMainAPI(MovyProvider())
         registerMainAPI(NetMirrorProvider())
         openSettings = { ctx -> NetMirrorSettings.show(ctx) }

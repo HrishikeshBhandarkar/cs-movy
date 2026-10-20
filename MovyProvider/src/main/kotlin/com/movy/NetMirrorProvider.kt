@@ -386,8 +386,11 @@ class NetMirrorProvider : MainAPI() {
         lastCookies = cookies
 
         if (cookies["user_token"].isNullOrBlank()) {
+            NetMirrorSettings.showLogin(
+                "NetMirror needs a user_token before playback. Log in or play one ad, then save and retry."
+            )
             throw ErrorLoadingException(
-                "NetMirror playback is locked. Open CloudStream Settings > Extensions > Movy > Settings > Login to NetMirror, log in and play one ad, then retry."
+                "NetMirror playback is locked. Finish the login popup, then retry."
             )
         }
 
@@ -419,8 +422,23 @@ class NetMirrorProvider : MainAPI() {
                 ).text
             }.getOrNull() ?: return false
         }
+        if (playlist.isBlank() ||
+            playlist.contains("/verify2") ||
+            playlist.contains("Just a moment")
+        ) {
+            NetMirrorSettings.showLogin(
+                "Your NetMirror session expired. Log in again to unlock playback."
+            )
+            throw ErrorLoadingException("NetMirror session expired. Complete the login popup, then retry.")
+        }
 
         val array = runCatching { JSONArray(playlist) }.getOrNull() ?: return false
+        if (array.length() == 0) {
+            NetMirrorSettings.showLogin(
+                "Your NetMirror session expired. Log in again to unlock playback."
+            )
+            throw ErrorLoadingException("NetMirror session expired. Complete the login popup, then retry.")
+        }
         val item = array.optJSONObject(0) ?: return false
         val sources = item.optJSONArray("sources") ?: return false
 
@@ -441,9 +459,15 @@ class NetMirrorProvider : MainAPI() {
                         referer = "$mainUrl/"
                     ).text
                 }.getOrNull()
-                if (master == null || master.contains("/220884/")) {
+                if (master == null) {
+                    throw ErrorLoadingException("Could not load the NetMirror stream. Check your connection and retry.")
+                }
+                if (master.contains("/220884/")) {
+                    NetMirrorSettings.showLogin(
+                        "Your NetMirror credentials are locked or expired. Log in again, save, then retry."
+                    )
                     throw ErrorLoadingException(
-                        "NetMirror token is not unlocked. Open plugin settings, log in / watch one ad, save, then retry."
+                        "NetMirror session expired. Complete the login popup, then retry."
                     )
                 }
                 first = false

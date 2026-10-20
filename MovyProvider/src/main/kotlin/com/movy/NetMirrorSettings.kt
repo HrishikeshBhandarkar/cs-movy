@@ -2,10 +2,14 @@ package com.movy
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Application
 import android.app.Dialog
 import android.content.Context
 import android.content.ContextWrapper
 import android.graphics.Color
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.ViewGroup
 import android.view.Window
 import android.webkit.CookieManager
@@ -17,6 +21,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import java.lang.ref.WeakReference
 import java.util.UUID
 
 object NetMirrorSettings {
@@ -27,13 +32,81 @@ object NetMirrorSettings {
             "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 " +
             "Safari/537.36 /OS.Gatu v3.0"
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    @Volatile
+    private var currentActivity: WeakReference<Activity>? = null
+
+    @Volatile
+    private var installed = false
+
+    @Volatile
+    private var loginShowing = false
+
+    @Volatile
+    private var pendingLogin: String? = null
+
+    fun init(context: Context) {
+        if (installed) return
+        val application = context.applicationContext as? Application ?: return
+        synchronized(this) {
+            if (installed) return
+            installed = true
+            application.registerActivityLifecycleCallbacks(
+                object : Application.ActivityLifecycleCallbacks {
+                    override fun onActivityResumed(activity: Activity) {
+                        currentActivity = WeakReference(activity)
+                        val reason = pendingLogin
+                        if (reason != null) {
+                            pendingLogin = null
+                            mainHandler.post { showLogin(reason) }
+                        }
+                    }
+
+                    override fun onActivityDestroyed(activity: Activity) {
+                        if (currentActivity?.get() === activity) {
+                            currentActivity = null
+                            loginShowing = false
+                        }
+                    }
+
+                    override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+                    override fun onActivityStarted(activity: Activity) = Unit
+                    override fun onActivityPaused(activity: Activity) = Unit
+                    override fun onActivityStopped(activity: Activity) = Unit
+                    override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+                }
+            )
+        }
+    }
+
     fun show(context: Context) {
-        val activity = context.findActivity()
+        val activity = resolveActivity(context) ?: return
+        runOnUi {
+            if (activity.isFinishing || activity.isDestroyed) return@runOnUi
+            showMenu(activity)
+        }
+    }
+
+    fun showLogin(reason: String? = null) {
+        val activity = resolveActivity()
         if (activity == null) {
-            Toast.makeText(context, "Open this from CloudStream settings", Toast.LENGTH_LONG).show()
+            pendingLogin = reason ?: "Log in to NetMirror to unlock playback."
             return
         }
+        runOnUi {
+            if (loginShowing) return@runOnUi
+            if (activity.isFinishing || activity.isDestroyed) {
+                pendingLogin = reason ?: "Log in to NetMirror to unlock playback."
+                return@runOnUi
+            }
+            loginShowing = true
+            openLogin(activity, reason)
+        }
+    }
 
+    private fun showMenu(activity: Activity) {
+        val hasToken = NetMirrorStore.userToken() != null
         val options = arrayOf(
             "Login to NetMirror",
             "Paste user_token",
@@ -41,9 +114,19 @@ object NetMirrorSettings {
         )
         AlertDialog.Builder(activity)
             .setTitle("NetMirror")
+            .setMessage(
+                if (hasToken) {
+                    "A session is saved. Use Login if playback asks for fresh credentials."
+                } else {
+                    "No user_token saved yet. Log in and save, or paste a token."
+                }
+            )
             .setItems(options) { _, which ->
                 when (which) {
-                    0 -> openLogin(activity)
+                    0 -> {
+                        loginShowing = true
+                        openLogin(activity, null)
+                    }
                     1 -> pasteToken(activity)
                     2 -> {
                         NetMirrorStore.clear()
@@ -55,10 +138,42 @@ object NetMirrorSettings {
             .show()
     }
 
-    private fun openLogin(activity: Activity) {
+    private fun resolveActivity(context: Context? = null): Activity? {
+        val direct = context?.findActivity()
+        if (direct != null && !direct.isFinishing && !direct.isDestroyed) return direct
+        return currentActivity?.get()?.takeIf { !it.isFinishing && !it.isDestroyed }
+    }
+
+    private fun runOnUi(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
+    }
+
+    private fun openLogin(activity: Activity, reason: String?) {
+        var dialog: Dialog? = null
+        try {
+            openLoginDialog(activity, reason) { created -> dialog = created }
+        } catch (error: Throwable) {
+            loginShowing = false
+            runCatching { dialog?.dismiss() }
+            Toast.makeText(
+                activity,
+                "Login screen failed to open. Use Paste user_token instead.",
+                Toast.LENGTH_LONG
+            ).show()
+            pasteToken(activity)
+        }
+    }
+
+    private fun openLoginDialog(activity: Activity, reason: String?, onCreated: (Dialog) -> Unit) {
         val dialog = Dialog(activity).apply {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
+            setCanceledOnTouchOutside(false)
         }
+        onCreated(dialog)
 
         val density = activity.resources.displayMetrics.density
         val padding = (12 * density).toInt()
@@ -80,6 +195,14 @@ object NetMirrorSettings {
             textSize = 16f
         }
 
+        val pasteButton = Button(activity).apply {
+            text = "Paste"
+            setOnClickListener {
+                dialog.dismiss()
+                pasteToken(activity)
+            }
+        }
+
         val saveButton = Button(activity).apply {
             text = "Save & close"
             setOnClickListener {
@@ -99,6 +222,7 @@ object NetMirrorSettings {
             title,
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         )
+        bar.addView(pasteButton)
         bar.addView(saveButton)
 
         val webView = WebView(activity).apply {
@@ -146,6 +270,17 @@ object NetMirrorSettings {
         }
 
         root.addView(bar)
+        if (!reason.isNullOrBlank()) {
+            root.addView(
+                TextView(activity).apply {
+                    text = reason
+                    setTextColor(Color.rgb(60, 45, 0))
+                    setBackgroundColor(Color.rgb(255, 245, 204))
+                    setPadding(padding, padding, padding, padding)
+                    textSize = 13f
+                }
+            )
+        }
         root.addView(
             webView,
             LinearLayout.LayoutParams(
@@ -157,15 +292,29 @@ object NetMirrorSettings {
 
         dialog.setContentView(root)
         dialog.setOnDismissListener {
+            loginShowing = false
             captureCookies(activity, notify = false)
             CookieManager.getInstance().flush()
             webView.destroy()
         }
         dialog.show()
-        webView.postUrl(
-            VERIFY_URL,
-            "g-recaptcha-response=${UUID.randomUUID()}".toByteArray(Charsets.UTF_8)
+        dialog.window?.setLayout(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
         )
+
+        val uuid = UUID.randomUUID().toString()
+        val html = """
+            <!doctype html>
+            <html><body>
+            <p>Opening NetMirror...</p>
+            <form id="verify" method="POST" action="$VERIFY_URL">
+              <input type="hidden" name="g-recaptcha-response" value="$uuid">
+            </form>
+            <script>document.getElementById('verify').submit()</script>
+            </body></html>
+        """.trimIndent()
+        webView.loadDataWithBaseURL("https://net52.cc/", html, "text/html", "UTF-8", null)
     }
 
     private fun captureCookies(context: Context, notify: Boolean = true): Boolean {
