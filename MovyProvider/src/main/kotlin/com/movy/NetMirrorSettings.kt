@@ -21,6 +21,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import com.lagradost.cloudstream3.CommonActivity
 import java.lang.ref.WeakReference
 import java.util.UUID
 
@@ -141,6 +142,8 @@ object NetMirrorSettings {
     private fun resolveActivity(context: Context? = null): Activity? {
         val direct = context?.findActivity()
         if (direct != null && !direct.isFinishing && !direct.isDestroyed) return direct
+        val common = runCatching { CommonActivity.activity }.getOrNull()
+        if (common != null && !common.isFinishing && !common.isDestroyed) return common
         return currentActivity?.get()?.takeIf { !it.isFinishing && !it.isDestroyed }
     }
 

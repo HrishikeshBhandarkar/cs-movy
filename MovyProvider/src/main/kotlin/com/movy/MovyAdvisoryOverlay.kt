@@ -5,7 +5,6 @@ import android.app.Application
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -15,7 +14,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.animation.LinearInterpolator
+import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -29,7 +28,16 @@ class MovyAdvisoryOverlay private constructor(
     private val handler = Handler(Looper.getMainLooper())
     private var activityRef: WeakReference<Activity>? = null
     private var card: View? = null
+    private var overlayViews: OverlayViews? = null
     private var session: Any? = null
+
+    private data class OverlayViews(
+        val root: View,
+        val ribbon: View,
+        val copy: View,
+        val rating: TextView,
+        val reasons: TextView
+    )
 
     override fun onActivityResumed(activity: Activity) {
         if (activityRef?.get() === activity && card?.parent != null) return
@@ -75,22 +83,23 @@ class MovyAdvisoryOverlay private constructor(
 
         removeExistingCard()
 
-        val badge = buildBadge(player.context)
+        val overlay = buildOverlay(player.context)
+        val root = overlay.root
         val params = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.START
         ).apply {
-            marginStart = dp(player.context, 36)
-            topMargin = dp(player.context, 36)
+            marginStart = dp(player.context, START_INSET_DP)
+            topMargin = dp(player.context, TOP_INSET_DP)
         }
 
-        badge.alpha = 0f
-        player.addView(badge, params)
-        card = badge
+        player.addView(root, params)
+        card = root
+        overlayViews = overlay
         Log.d(TAG, "Attached demo advisory overlay")
 
-        badge.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+        root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(v: View) = Unit
 
             override fun onViewDetachedFromWindow(v: View) {
@@ -99,7 +108,7 @@ class MovyAdvisoryOverlay private constructor(
         })
 
         var started = false
-        badge.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+        root.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
             override fun onLayoutChange(
                 v: View,
                 left: Int,
@@ -114,32 +123,59 @@ class MovyAdvisoryOverlay private constructor(
                 if (started || bottom - top <= 0) return
                 started = true
                 v.removeOnLayoutChangeListener(this)
-                startSequence(v, activeSession)
+                syncRibbonHeight(overlay)
+                v.post { startSequence(overlay, activeSession) }
             }
         })
     }
 
-    private fun startSequence(view: View, activeSession: Any) {
-        if (!isActive(view, activeSession)) return
+    private fun syncRibbonHeight(overlay: OverlayViews) {
+        if (overlay.copy.height <= 0) return
+        val height = overlay.copy.height.coerceAtLeast(dp(overlay.copy.context, RIBBON_MIN_HEIGHT_DP))
+        val params = overlay.ribbon.layoutParams as? LinearLayout.LayoutParams ?: return
+        if (params.height == height) return
+        params.height = height
+        overlay.ribbon.layoutParams = params
+    }
+
+    private fun ribbonHeight(overlay: OverlayViews): Float =
+        maxOf(
+            overlay.ribbon.height,
+            overlay.copy.height,
+            dp(overlay.copy.context, RIBBON_MIN_HEIGHT_DP)
+        ).toFloat()
+
+    private fun startSequence(overlay: OverlayViews, activeSession: Any) {
+        val root = overlay.root
+        if (!isActive(root, activeSession)) return
+        syncRibbonHeight(overlay)
+        if (overlay.ribbon.height <= 0 || overlay.rating.width <= 0 || overlay.reasons.width <= 0) {
+            handler.postAtTime(
+                Runnable { startSequence(overlay, activeSession) },
+                activeSession,
+                SystemClock.uptimeMillis() + 16L
+            )
+            return
+        }
 
         handler.postAtTime(
             Runnable {
-                if (!isActive(view, activeSession)) return@Runnable
-                enter(view)
+                if (!isActive(root, activeSession)) return@Runnable
+                enter(overlay)
                 handler.postAtTime(
                     Runnable {
-                        if (!isActive(view, activeSession)) return@Runnable
-                        exit(view)
+                        if (!isActive(root, activeSession)) return@Runnable
+                        exit(overlay)
                         handler.postAtTime(
                             Runnable {
-                                if (isActive(view, activeSession)) removeCard(view)
+                                if (isActive(root, activeSession)) removeCard(root)
                             },
                             activeSession,
-                            SystemClock.uptimeMillis() + SETTLE_MS
+                            SystemClock.uptimeMillis() + (CYCLE_MS - EXIT_AT_MS)
                         )
                     },
                     activeSession,
-                    SystemClock.uptimeMillis() + HOLD_MS
+                    SystemClock.uptimeMillis() + EXIT_AT_MS
                 )
             },
             activeSession,
@@ -147,27 +183,73 @@ class MovyAdvisoryOverlay private constructor(
         )
     }
 
-    private fun enter(view: View) {
-        view.animate().cancel()
-        val height = view.height.toFloat().coerceAtLeast(1f)
-        view.alpha = 0f
-        view.translationY = height / 2f
-        view.animate()
+    private fun enter(overlay: OverlayViews) {
+        overlay.ribbon.animate().cancel()
+        overlay.rating.animate().cancel()
+        overlay.reasons.animate().cancel()
+
+        overlay.ribbon.pivotY = ribbonHeight(overlay)
+        overlay.ribbon.scaleY = 0f
+        overlay.ribbon.alpha = 0f
+
+        overlay.rating.alpha = 1f
+        overlay.reasons.alpha = 1f
+        overlay.rating.translationX = -overlay.rating.width * MASK_TRAVEL
+        overlay.reasons.translationX = -overlay.reasons.width * MASK_TRAVEL
+
+        overlay.ribbon.animate()
+            .scaleY(1f)
             .alpha(1f)
-            .translationY(0f)
-            .setDuration(ANIMATION_MS)
-            .setInterpolator(LinearInterpolator())
+            .setDuration(BAR_IN_MS)
+            .setInterpolator(IN_EASE)
+            .start()
+
+        overlay.rating.animate()
+            .translationX(0f)
+            .setStartDelay(RATING_IN_DELAY_MS)
+            .setDuration(TEXT_SLIDE_MS)
+            .setInterpolator(IN_EASE)
+            .start()
+
+        overlay.reasons.animate()
+            .translationX(0f)
+            .setStartDelay(DESCRIPTORS_IN_DELAY_MS)
+            .setDuration(TEXT_SLIDE_MS)
+            .setInterpolator(IN_EASE)
             .start()
     }
 
-    private fun exit(view: View) {
-        view.animate().cancel()
-        val height = view.height.toFloat().coerceAtLeast(1f)
-        view.animate()
+    private fun exit(overlay: OverlayViews) {
+        overlay.ribbon.animate().cancel()
+        overlay.rating.animate().cancel()
+        overlay.reasons.animate().cancel()
+
+        overlay.ribbon.pivotY = ribbonHeight(overlay)
+
+        overlay.descriptorsExit()
+        overlay.rating.animate()
+            .translationX(-overlay.rating.width * MASK_TRAVEL)
+            .setStartDelay(RATING_OUT_DELAY_MS)
+            .setDuration(TEXT_RETRACT_MS)
+            .setInterpolator(OUT_EASE)
+            .withEndAction { overlay.rating.alpha = 0f }
+            .start()
+
+        overlay.ribbon.animate()
+            .scaleY(0f)
             .alpha(0f)
-            .translationY(height)
-            .setDuration(ANIMATION_MS)
-            .setInterpolator(LinearInterpolator())
+            .setStartDelay(BAR_OUT_DELAY_MS)
+            .setDuration(BAR_OUT_MS)
+            .setInterpolator(OUT_EASE)
+            .start()
+    }
+
+    private fun OverlayViews.descriptorsExit() {
+        reasons.animate()
+            .translationX(-reasons.width * MASK_TRAVEL)
+            .setDuration(TEXT_RETRACT_MS)
+            .setInterpolator(OUT_EASE)
+            .withEndAction { reasons.alpha = 0f }
             .start()
     }
 
@@ -179,16 +261,26 @@ class MovyAdvisoryOverlay private constructor(
 
     private fun removeCard(view: View) {
         if (card !== view) return
-        view.animate().cancel()
+        cancelAnimations()
         (view.parent as? ViewGroup)?.removeView(view)
         card = null
+        overlayViews = null
     }
 
     private fun removeExistingCard() {
         val current = card ?: return
         card = null
-        current.animate().cancel()
+        cancelAnimations()
         (current.parent as? ViewGroup)?.removeView(current)
+        overlayViews = null
+    }
+
+    private fun cancelAnimations() {
+        overlayViews?.let {
+            it.ribbon.animate().cancel()
+            it.rating.animate().cancel()
+            it.reasons.animate().cancel()
+        }
     }
 
     private fun cleanupCard() {
@@ -206,60 +298,69 @@ class MovyAdvisoryOverlay private constructor(
         removeExistingCard()
     }
 
-    private fun buildBadge(context: Context): View {
-        val card = LinearLayout(context).apply {
+    private fun buildOverlay(context: Context): OverlayViews {
+        val root = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(context, 12), dp(context, 8), dp(context, 14), dp(context, 8))
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.RECTANGLE
-                cornerRadius = dp(context, 6).toFloat()
-                setColor(Color.argb(224, 18, 18, 18))
-                setStroke(dp(context, 1), Color.argb(64, 255, 255, 255))
-            }
-            elevation = dp(context, 6).toFloat()
+            gravity = Gravity.TOP
             isClickable = false
             isFocusable = false
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        }
+
+        val ribbon = View(context).apply {
+            setBackgroundColor(RIBBON_COLOR)
+        }
+
+        val copy = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            clipChildren = true
+            clipToPadding = false
+            setPadding(dp(context, TEXT_GAP_DP), 0, dp(context, 4), 0)
+            isClickable = false
+            isFocusable = false
         }
 
         val rating = TextView(context).apply {
             text = DEMO_RATING
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            gravity = Gravity.CENTER
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
             includeFontPadding = false
-            setPadding(dp(context, 7), dp(context, 2), dp(context, 7), dp(context, 2))
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.RECTANGLE
-                cornerRadius = dp(context, 3).toFloat()
-                setColor(Color.TRANSPARENT)
-                setStroke(dp(context, 1), Color.argb(220, 255, 255, 255))
-            }
+            isSingleLine = true
+            letterSpacing = 0.04f
+            setShadowLayer(4f, 0f, 2f, Color.argb(230, 0, 0, 0))
         }
 
-        val message = TextView(context).apply {
+        val reasons = TextView(context).apply {
             text = DEMO_TEXT
-            setTextColor(Color.WHITE)
+            setTextColor(REASON_COLOR)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+            typeface = Typeface.create("sans-serif", Typeface.NORMAL)
             includeFontPadding = false
-            maxLines = 2
+            isSingleLine = true
+            maxWidth = (context.resources.displayMetrics.widthPixels - dp(context, 96))
+                .coerceAtLeast(dp(context, 180))
+            setShadowLayer(3f, 0f, 1f, Color.argb(220, 0, 0, 0))
         }
 
-        card.addView(rating, LinearLayout.LayoutParams(
+        copy.addView(rating, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
-        card.addView(message, LinearLayout.LayoutParams(
+        copy.addView(reasons, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            marginStart = dp(context, 10)
+            topMargin = dp(context, 3)
         })
-        card.contentDescription = "Content advisory: $DEMO_RATING, $DEMO_TEXT"
-        return card
+
+        root.addView(ribbon, LinearLayout.LayoutParams(dp(context, RIBBON_WIDTH_DP), 0))
+        root.addView(copy, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.contentDescription = "Content advisory: $DEMO_RATING, $DEMO_TEXT"
+        return OverlayViews(root, ribbon, copy, rating, reasons)
     }
 
     private fun dp(context: Context, value: Int): Int =
@@ -283,14 +384,31 @@ class MovyAdvisoryOverlay private constructor(
 
     companion object {
         private const val TAG = "MovyAdvisoryOverlay"
-        private const val DELAY_MS = 1_500L
-        private const val HOLD_MS = 8_000L
-        private const val ANIMATION_MS = 700L
-        private const val SETTLE_MS = 1_400L
+        private const val DELAY_MS = 0L
+        private const val EXIT_AT_MS = 4_500L
+        private const val CYCLE_MS = 5_220L
+        private const val BAR_IN_MS = 350L
+        private const val TEXT_SLIDE_MS = 460L
+        private const val RATING_IN_DELAY_MS = 200L
+        private const val DESCRIPTORS_IN_DELAY_MS = 260L
+        private const val TEXT_RETRACT_MS = 390L
+        private const val RATING_OUT_DELAY_MS = 60L
+        private const val BAR_OUT_DELAY_MS = 380L
+        private const val BAR_OUT_MS = 340L
+        private const val RIBBON_WIDTH_DP = 4
+        private const val RIBBON_MIN_HEIGHT_DP = 44
+        private const val START_INSET_DP = 48
+        private const val TOP_INSET_DP = 42
+        private const val TEXT_GAP_DP = 14
+        private const val MASK_TRAVEL = 1.08f
         private const val POLL_INTERVAL_MS = 250L
         private const val MAX_POLL_ATTEMPTS = 40
-        private const val DEMO_RATING = "16"
-        private const val DEMO_TEXT = "Violence, Language"
+        private const val DEMO_RATING = "RATED A"
+        private const val DEMO_TEXT = "self-harm, sex, violence, substances, suicide, tobacco use"
+        private val RIBBON_COLOR = Color.parseColor("#E50914")
+        private val REASON_COLOR = Color.rgb(179, 179, 179)
+        private val IN_EASE = PathInterpolator(0.16f, 1f, 0.3f, 1f)
+        private val OUT_EASE = PathInterpolator(0.65f, 0f, 0.35f, 1f)
 
         @Volatile
         private var instance: MovyAdvisoryOverlay? = null

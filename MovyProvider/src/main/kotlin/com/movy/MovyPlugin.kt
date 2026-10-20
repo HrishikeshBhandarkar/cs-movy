@@ -9,6 +9,7 @@ class MovyPlugin : Plugin() {
     override fun load(context: Context) {
         NetMirrorStore.init(context)
         NetMirrorSettings.init(context)
+        MovyAdvisoryOverlay.install(context)
         registerMainAPI(MovyProvider())
         registerMainAPI(NetMirrorProvider())
         openSettings = { ctx -> NetMirrorSettings.show(ctx) }
