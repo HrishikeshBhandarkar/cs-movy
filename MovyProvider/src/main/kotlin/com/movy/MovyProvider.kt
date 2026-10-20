@@ -1,17 +1,16 @@
 package com.movy
 
 import com.lagradost.cloudstream3.Episode
-import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.MainPageData
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
@@ -32,30 +31,48 @@ class MovyProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"
     override val hasMainPage = true
-    override val mainPage = listOf(MainPageData("Home", "", false))
+    override val hasQuickSearch = true
+    override val hasChromecastSupport = true
+
+    override val mainPage = mainPageOf(
+        "$DB/trending/all/day" to "Trending",
+        "$DB/movie/popular" to "Popular Movies",
+        "$DB/tv/popular" to "Popular TV Shows",
+        "$DB/movie/now_playing" to "Now Playing in Theaters",
+        "$DB/discover/tv?with_networks=213" to "Netflix",
+        "$DB/discover/tv?with_networks=2739" to "Disney+",
+        "$DB/discover/tv?with_networks=49" to "HBO",
+        "$DB/movie/top_rated" to "Top Rated Movies",
+        "$DB/tv/top_rated" to "Top Rated TV Shows"
+    )
 
     private val headers = mapOf(
         "User-Agent" to USER_AGENT,
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept" to "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer" to "$mainUrl/"
     )
 
     private fun JSONObject.str(key: String): String? =
         optString(key).takeIf { it.isNotBlank() && it != "null" }
 
-    private fun JSONObject.searchResponse(): SearchResponse? {
-        val type = when (str("mediaType")) {
-            "movie" -> "movie"
-            "tv" -> "tv"
+    private fun JSONObject.toSearchResponse(defaultType: String? = null): SearchResponse? {
+        val type = when {
+            has("media_type") -> str("media_type")
+            has("mediaType") -> str("mediaType")
+            defaultType != null -> defaultType
+            has("title") -> "movie"
+            has("name") -> "tv"
             else -> {
-                val slug = str("slug") ?: return null
+                val slug = str("slug")
                 when {
-                    slug.startsWith("/movie/") -> "movie"
-                    slug.startsWith("/tv/") -> "tv"
-                    else -> return null
+                    slug?.startsWith("/movie/") == true -> "movie"
+                    slug?.startsWith("/tv/") == true -> "tv"
+                    else -> null
                 }
             }
-        }
+        } ?: return null
+
+        if (type != "movie" && type != "tv") return null
 
         var id = optInt("id", 0)
         if (id == 0) {
@@ -64,20 +81,27 @@ class MovyProvider : MainAPI() {
         }
 
         val title = str("title") ?: str("name") ?: return null
-        val poster = str("poster") ?: str("image")
+        val posterPath = str("poster_path")
+        val poster = if (!posterPath.isNullOrBlank()) {
+            if (posterPath.startsWith("http")) posterPath else "$IMG$posterPath"
+        } else {
+            str("poster") ?: str("image")
+        }
+
         val date = str("release_date") ?: str("first_air_date")
         val year = date?.take(4)?.toIntOrNull()
-        val rating = optDouble("rating", 0.0)
+        val rating = optDouble("vote_average", optDouble("rating", 0.0))
         val score = if (rating > 0) Score.from10(rating) else null
+        val href = "$mainUrl/$type/$id"
 
         return if (type == "movie") {
-            newMovieSearchResponse(title, "movie/$id", TvType.Movie) {
+            newMovieSearchResponse(title, href, TvType.Movie) {
                 this.posterUrl = poster
                 this.year = year
                 this.score = score
             }
         } else {
-            newTvSeriesSearchResponse(title, "tv/$id", TvType.TvSeries) {
+            newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
                 this.posterUrl = poster
                 this.year = year
                 this.score = score
@@ -86,93 +110,77 @@ class MovyProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList<HomePageList>())
-        val document = app.get("$mainUrl/", headers = headers).document
-        val nextData = document.selectFirst("script#__NEXT_DATA__")?.data() ?: return newHomePageResponse(emptyList())
-        val pageProps = JSONObject(nextData)
-            .optJSONObject("props")
-            ?.optJSONObject("pageProps")
-            ?: return newHomePageResponse(emptyList())
-
-        val sections = mutableListOf<HomePageList>()
-        val seen = mutableSetOf<String>()
-
-        fun addSection(sectionName: String, array: org.json.JSONArray?) {
-            if (array == null) return
-            val name = sectionName.replace('_', ' ').replaceFirstChar { it.uppercase() }
-            if (!seen.add(name)) return
-            val items = mutableListOf<SearchResponse>()
-            for (i in 0 until minOf(array.length(), 30)) {
-                val item = array.optJSONObject(i)?.searchResponse() ?: continue
-                items.add(item)
-            }
-            if (items.isNotEmpty()) sections.add(HomePageList(name, items))
+        val url = if (request.data.contains("?")) {
+            "${request.data}&page=$page"
+        } else {
+            "${request.data}?page=$page"
         }
 
-        for (key in listOf("trendingSections", "defaultSections", "streamingSections")) {
-            val groups = pageProps.optJSONArray(key) ?: continue
-            for (i in 0 until groups.length()) {
-                val group = groups.optJSONObject(i) ?: continue
-                addSection(group.optString("name"), group.optJSONArray("movies"))
-            }
-        }
-        addSection("Upcoming TV", pageProps.optJSONArray("upcomingTv"))
-        addSection("Recently Added 4K", pageProps.optJSONArray("recent4k"))
+        val responseText = runCatching {
+            app.get(url, headers = headers).text
+        }.getOrNull() ?: return newHomePageResponse(request.name, emptyList())
 
-        return newHomePageResponse(sections)
+        val results = runCatching { JSONObject(responseText) }.getOrNull()
+            ?.optJSONArray("results")
+            ?: return newHomePageResponse(request.name, emptyList())
+
+        val defaultType = when {
+            request.data.contains("/movie/") || request.data.contains("/movie?") -> "movie"
+            request.data.contains("/tv/") || request.data.contains("/tv?") -> "tv"
+            else -> null
+        }
+
+        val items = mutableListOf<SearchResponse>()
+        for (i in 0 until results.length()) {
+            val obj = results.optJSONObject(i) ?: continue
+            val item = obj.toSearchResponse(defaultType) ?: continue
+            items.add(item)
+        }
+
+        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val response = app.get(
-            "$DB/search/multi",
-            params = mapOf("query" to query, "page" to "1"),
-            headers = headers
-        )
-        val results = runCatching { JSONObject(response.text) }.getOrNull()
+        val responseText = runCatching {
+            app.get(
+                "$DB/search/multi",
+                params = mapOf("query" to query, "page" to "1"),
+                headers = headers
+            ).text
+        }.getOrNull() ?: return emptyList()
+
+        val results = runCatching { JSONObject(responseText) }.getOrNull()
             ?.optJSONArray("results")
             ?: return emptyList()
 
         val items = mutableListOf<SearchResponse>()
         for (i in 0 until results.length()) {
             val obj = results.optJSONObject(i) ?: continue
-            val type = obj.str("media_type") ?: continue
-            if (type != "movie" && type != "tv") continue
-            val id = obj.optInt("id", 0)
-            if (id == 0) continue
-            val title = if (type == "movie") obj.str("title") else obj.str("name")
-            if (title.isNullOrBlank()) continue
-            val date = if (type == "movie") obj.str("release_date") else obj.str("first_air_date")
-            val year = date?.take(4)?.toIntOrNull()
-            val poster = obj.str("poster_path")?.let { "$IMG$it" }
-            val rating = obj.optDouble("vote_average", 0.0)
-            val score = if (rating > 0) Score.from10(rating) else null
-
-            items.add(
-                if (type == "movie") {
-                    newMovieSearchResponse(title, "movie/$id", TvType.Movie) {
-                        this.posterUrl = poster
-                        this.year = year
-                        this.score = score
-                    }
-                } else {
-                    newTvSeriesSearchResponse(title, "tv/$id", TvType.TvSeries) {
-                        this.posterUrl = poster
-                        this.year = year
-                        this.score = score
-                    }
-                }
-            )
+            val item = obj.toSearchResponse() ?: continue
+            items.add(item)
         }
         return items
     }
 
+    override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
+
     override suspend fun load(url: String): LoadResponse? {
-        val match = Regex("(movie|tv)/(\\d+)").find(url) ?: return null
-        val type = match.groupValues[1]
-        val id = match.groupValues[2].toIntOrNull() ?: return null
+        val clean = url.trim()
+        val match = Regex("""(?:^|/|\|)(movie|tv)(?:/|\|)(\d+)""").find(clean)
+            ?: Regex(""""(?:media_?type|type)"\s*:\s*"(movie|tv)".*?"id"\s*:\s*(\d+)""").find(clean)
+            ?: Regex(""""id"\s*:\s*(\d+).*?"(?:media_?type|type)"\s*:\s*"(movie|tv)"""").find(clean)
+
+        val (type, id) = if (match != null) {
+            match.groupValues[1] to (match.groupValues[2].toIntOrNull() ?: return null)
+        } else {
+            val parts = clean.trim('/').split('/')
+            val t = parts.firstOrNull { it == "movie" || it == "tv" } ?: return null
+            val i = parts.lastOrNull()?.toIntOrNull() ?: return null
+            t to i
+        }
 
         val detail = runCatching {
-            JSONObject(app.get("$DB/$type/$id?append_to_response=external_ids", headers = headers).text)
+            JSONObject(app.get("$DB/$type/$id?append_to_response=external_ids,images,credits", headers = headers).text)
         }.getOrNull() ?: return null
 
         val title = detail.str("title") ?: detail.str("name") ?: return null
@@ -187,11 +195,39 @@ class MovyProvider : MainAPI() {
             (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.str("name") }
         }.orEmpty()
 
+        val actors = detail.optJSONObject("credits")?.optJSONArray("cast")?.let { castArr ->
+            (0 until minOf(castArr.length(), 10)).mapNotNull { i ->
+                castArr.optJSONObject(i)?.str("name")
+            }
+        }.orEmpty()
+
+        // Extract transparent logo for movie/series header
+        val logos = detail.optJSONObject("images")?.optJSONArray("logos")
+        val logoPath = if (logos != null) {
+            var enLogo: String? = null
+            var firstLogo: String? = null
+            for (i in 0 until logos.length()) {
+                val obj = logos.optJSONObject(i) ?: continue
+                val path = obj.str("file_path") ?: continue
+                if (firstLogo == null) firstLogo = path
+                val lang = obj.str("iso_639_1")
+                if (lang == "en") {
+                    enLogo = path
+                    break
+                }
+            }
+            enLogo ?: firstLogo
+        } else null
+        val logoUrl = logoPath?.let { "$IMG$it" }
+
+        val loadUrl = "$mainUrl/$type/$id"
+
         if (type == "movie") {
             val runtime = detail.optInt("runtime", 0).takeIf { it > 0 }
-            return newMovieLoadResponse(title, url, TvType.Movie, "movie|$id") {
+            return newMovieLoadResponse(title, loadUrl, TvType.Movie, "movie|$id") {
                 this.posterUrl = poster
                 this.backgroundPosterUrl = backdrop
+                this.logoUrl = logoUrl
                 this.plot = plot
                 this.year = year
                 this.tags = genres
@@ -227,9 +263,10 @@ class MovyProvider : MainAPI() {
             }
         }
 
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+        return newTvSeriesLoadResponse(title, loadUrl, TvType.TvSeries, episodes) {
             this.posterUrl = poster
             this.backgroundPosterUrl = backdrop
+            this.logoUrl = logoUrl
             this.plot = plot
             this.year = year
             this.tags = genres
@@ -243,13 +280,24 @@ class MovyProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split("|")
-        if (parts.size < 2) return false
-        val type = parts[0]
-        val id = parts[1].toIntOrNull() ?: return false
+        val type: String
+        val id: Int
+        var season: Int? = null
+        var episode: Int? = null
+
+        if (data.contains("|")) {
+            val parts = data.split("|")
+            type = parts.getOrNull(0) ?: return false
+            id = parts.getOrNull(1)?.toIntOrNull() ?: return false
+            season = parts.getOrNull(2)?.toIntOrNull()
+            episode = parts.getOrNull(3)?.toIntOrNull()
+        } else {
+            val match = Regex("""(?:^|/)(movie|tv)/(\d+)""").find(data) ?: return false
+            type = match.groupValues[1]
+            id = match.groupValues[2].toIntOrNull() ?: return false
+        }
+
         if (type != "movie" && type != "tv") return false
-        val season = parts.getOrNull(2)?.toIntOrNull()
-        val episode = parts.getOrNull(3)?.toIntOrNull()
 
         val detail = runCatching {
             JSONObject(app.get("$DB/$type/$id?append_to_response=external_ids", headers = headers).text)
