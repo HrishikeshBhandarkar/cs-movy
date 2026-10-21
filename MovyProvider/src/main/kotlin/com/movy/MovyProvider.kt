@@ -23,6 +23,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import android.util.Log
 import org.json.JSONObject
 import java.net.URLEncoder
 
@@ -36,6 +37,9 @@ class MovyProvider : MainAPI() {
     override val hasChromecastSupport = true
 
     override val mainPage = mainPageOf("" to "Home")
+
+    private val bingr = BingrProvider()
+    private val netMirror = NetMirrorProvider()
 
     private data class HomeRow(val title: String, val url: String, val type: String? = null)
 
@@ -278,6 +282,7 @@ class MovyProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        Log.d(TAG, "loadLinks data=$data")
         val type: String
         val id: Int
         var season: Int? = null
@@ -285,7 +290,7 @@ class MovyProvider : MainAPI() {
 
         if (data.contains("|")) {
             val parts = data.split("|")
-            type = parts.getOrNull(0) ?: return false
+            type = parts.getOrNull(0)?.substringAfterLast("/")?.trimEnd('/') ?: return false
             id = parts.getOrNull(1)?.toIntOrNull() ?: return false
             season = parts.getOrNull(2)?.toIntOrNull()
             episode = parts.getOrNull(3)?.toIntOrNull()
@@ -296,17 +301,24 @@ class MovyProvider : MainAPI() {
         }
 
         if (type != "movie" && type != "tv") return false
+        Log.d(TAG, "parsed type=$type id=$id season=$season episode=$episode")
 
         val detail = runCatching {
             JSONObject(app.get("$DB/$type/$id?append_to_response=external_ids", headers = headers).text)
+        }.onFailure {
+            Log.e(TAG, "detail request failed for $type/$id", it)
         }.getOrNull() ?: return false
 
-        val title = detail.str("title") ?: detail.str("name") ?: return false
+        val title = detail.str("title") ?: detail.str("name") ?: run {
+            Log.e(TAG, "detail missing title for $type/$id")
+            return false
+        }
         val date = detail.str("release_date") ?: detail.str("first_air_date")
         val year = date?.take(4)?.toIntOrNull()
         val imdbId = detail.optJSONObject("external_ids")?.str("imdb_id")
             ?: detail.str("imdb_id")
         val totalSeasons = detail.optInt("number_of_seasons", 1).coerceAtLeast(1)
+        Log.d(TAG, "detail title=$title year=$year imdb=$imdbId seasons=$totalSeasons")
 
         val seed = runCatching {
             JSONObject(
@@ -316,6 +328,8 @@ class MovyProvider : MainAPI() {
                     headers = headers
                 ).text
             ).getString("seed")
+        }.onFailure {
+            Log.e(TAG, "seed request failed for $id", it)
         }.getOrNull() ?: return false
 
         val params = mutableMapOf(
@@ -333,20 +347,43 @@ class MovyProvider : MainAPI() {
             params["episodeId"] = (episode ?: 1).toString()
         }
 
+        val seenSources = mutableSetOf<String>()
+        val seenSubtitles = mutableSetOf<String>()
+        var foundSource = false
+
         for (server in SERVERS) {
             val body = runCatching {
                 app.get("$API/$server/sources", params = params, headers = headers).text
-            }.getOrNull() ?: continue
+            }.onFailure {
+                Log.e(TAG, "movy $server request failed", it)
+            }.getOrNull()
+            if (body == null) {
+                Log.d(TAG, "movy $server no response")
+                continue
+            }
+            Log.d(TAG, "movy $server response chars=${body.length}")
 
-            val decoded = runCatching { MovyCrypto.decrypt(body, seed, id) }.getOrNull() ?: continue
-            val json = runCatching { JSONObject(decoded) }.getOrNull() ?: continue
+            val decoded = runCatching { MovyCrypto.decrypt(body, seed, id) }
+                .onFailure { Log.e(TAG, "movy $server decrypt failed", it) }
+                .getOrNull()
+            if (decoded == null) continue
+            val json = runCatching { JSONObject(decoded) }
+                .onFailure { Log.e(TAG, "movy $server json failed", it) }
+                .getOrNull()
+            if (json == null) continue
 
-            val sources = json.optJSONArray("sources") ?: continue
+            val sources = json.optJSONArray("sources")
+            if (sources == null) {
+                Log.d(TAG, "movy $server no sources array")
+                continue
+            }
+            Log.d(TAG, "movy $server sources=${sources.length()}")
             if (sources.length() == 0) continue
 
             for (i in 0 until sources.length()) {
                 val source = sources.optJSONObject(i) ?: continue
                 val sourceUrl = source.str("url") ?: continue
+                if (sourceUrl.isBlank() || !seenSources.add(sourceUrl)) continue
                 val quality = source.optString("quality")
                 callback.invoke(
                     newExtractorLink(
@@ -359,6 +396,7 @@ class MovyProvider : MainAPI() {
                         this.quality = qualityOf(quality)
                     }
                 )
+                foundSource = true
             }
 
             val subtitles = json.optJSONArray("subtitles")
@@ -366,6 +404,7 @@ class MovyProvider : MainAPI() {
                 for (i in 0 until subtitles.length()) {
                     val subtitleObj = subtitles.optJSONObject(i) ?: continue
                     val subtitleUrl = subtitleObj.str("url") ?: continue
+                    if (subtitleUrl.isBlank() || !seenSubtitles.add(subtitleUrl)) continue
                     val language = subtitleObj.str("lang") ?: subtitleObj.str("language") ?: "Unknown"
                     subtitleCallback.invoke(
                         newSubtitleFile(language, subtitleUrl) {
@@ -377,9 +416,52 @@ class MovyProvider : MainAPI() {
                     )
                 }
             }
-            return true
+            break
         }
-        return false
+
+        Log.d(TAG, "movy stage done found=$foundSource; starting NetMirror")
+        val netMirrorFound = runCatching {
+            netMirror.loadLinksForTitle(
+                title = title,
+                season = season,
+                episode = episode,
+                subtitleCallback = { subtitle ->
+                    if (seenSubtitles.add(subtitle.url)) subtitleCallback.invoke(subtitle)
+                },
+                callback = { link ->
+                    if (seenSources.add(link.url)) {
+                        callback.invoke(link)
+                        foundSource = true
+                    }
+                }
+            )
+        }.onFailure {
+            Log.e(TAG, "NetMirror hybrid failed", it)
+        }.getOrDefault(false)
+        Log.d(TAG, "NetMirror stage done found=$netMirrorFound")
+
+        Log.d(TAG, "starting Bingr")
+        val bingrFound = runCatching {
+            bingr.loadLinks(
+                data = data,
+                isCasting = isCasting,
+                subtitleCallback = { subtitle ->
+                    if (seenSubtitles.add(subtitle.url)) subtitleCallback.invoke(subtitle)
+                },
+                callback = { link ->
+                    if (seenSources.add(link.url)) {
+                        callback.invoke(link)
+                        foundSource = true
+                    }
+                }
+            )
+        }.onFailure {
+            Log.e(TAG, "Bingr hybrid failed", it)
+        }.getOrDefault(false)
+        Log.d(TAG, "Bingr stage done found=$bingrFound")
+
+        Log.d(TAG, "final found=$foundSource netMirror=$netMirrorFound bingr=$bingrFound")
+        return foundSource || netMirrorFound || bingrFound
     }
 
     private fun encodeComponent(value: String): String =
@@ -396,6 +478,7 @@ class MovyProvider : MainAPI() {
     }
 
     companion object {
+        private const val TAG = "MovyProvider"
         private const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         private const val API = "https://api.wecollege.net"
         private const val DB = "https://db.wecollege.net/3"

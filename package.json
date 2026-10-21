@@ -1,0 +1,19 @@
+{
+  "name": "testplugins",
+  "version": "1.0.0",
+  "description": "Unofficial [CloudStream](https://github.com/recloudstream/cloudstream) provider for [movy.sx](https://www.movy.sx), with search, home rows, movies, TV series, seasons/episodes, multiple qualities and subtitles.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HrishikeshBhandarkar/cs-movy.git"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/HrishikeshBhandarkar/cs-movy/issues"
+  },
+  "homepage": "https://github.com/HrishikeshBhandarkar/cs-movy#readme"
+}

@@ -23,11 +23,11 @@ import android.widget.TextView
 import android.widget.Toast
 import com.lagradost.cloudstream3.CommonActivity
 import java.lang.ref.WeakReference
-import java.util.UUID
 
 object NetMirrorSettings {
-    private const val VERIFY_URL = "https://net52.cc/verify.php"
-    private const val MOBILE_HOME = "https://net52.cc/mobile/home?app=1"
+    private const val VERIFY_URL = "https://net77.cc/verify.php"
+    private const val LOGIN_URL = "https://net77.cc/login"
+    private const val MOBILE_HOME = "https://net77.cc/mobile/home?app=1"
     private const val MOBILE_UA =
         "Mozilla/5.0 (Linux; Android 13; Pixel 5 Build/TQ3A.230901.001; wv) " +
             "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 " +
@@ -242,7 +242,7 @@ object NetMirrorSettings {
                     request: WebResourceRequest?
                 ): Boolean {
                     val url = request?.url?.toString().orEmpty()
-                    if (url.startsWith("https://net52.cc/home")) {
+                    if (isNetMirrorHome(url)) {
                         view?.loadUrl(MOBILE_HOME)
                         return true
                     }
@@ -251,7 +251,7 @@ object NetMirrorSettings {
 
                 @Deprecated("Deprecated in Java")
                 override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                    if (url?.startsWith("https://net52.cc/home") == true) {
+                    if (isNetMirrorHome(url)) {
                         view?.loadUrl(MOBILE_HOME)
                         return true
                     }
@@ -260,7 +260,7 @@ object NetMirrorSettings {
 
                 override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                     super.onPageStarted(view, url, favicon)
-                    if (url?.startsWith("https://net52.cc/home") == true) {
+                    if (isNetMirrorHome(url)) {
                         view?.loadUrl(MOBILE_HOME)
                     }
                 }
@@ -271,6 +271,12 @@ object NetMirrorSettings {
                 }
             }
         }
+
+        val loginButton = Button(activity).apply {
+            text = "Login"
+            setOnClickListener { webView.loadUrl(LOGIN_URL) }
+        }
+        bar.addView(loginButton)
 
         root.addView(bar)
         if (!reason.isNullOrBlank()) {
@@ -306,19 +312,12 @@ object NetMirrorSettings {
             ViewGroup.LayoutParams.MATCH_PARENT
         )
 
-        val uuid = UUID.randomUUID().toString()
-        val html = """
-            <!doctype html>
-            <html><body>
-            <p>Opening NetMirror...</p>
-            <form id="verify" method="POST" action="$VERIFY_URL">
-              <input type="hidden" name="g-recaptcha-response" value="$uuid">
-            </form>
-            <script>document.getElementById('verify').submit()</script>
-            </body></html>
-        """.trimIndent()
-        webView.loadDataWithBaseURL("https://net52.cc/", html, "text/html", "UTF-8", null)
+        webView.loadUrl(VERIFY_URL)
     }
+
+    private fun isNetMirrorHome(url: String?): Boolean =
+        url?.startsWith("https://net77.cc/home") == true ||
+            url?.startsWith("https://net52.cc/home") == true
 
     private fun captureCookies(context: Context, notify: Boolean = true): Boolean {
         val manager = CookieManager.getInstance()

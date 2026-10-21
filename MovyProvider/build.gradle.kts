@@ -1,7 +1,7 @@
-version = 4
+version = 6
 
 cloudstream {
-    description = "Movies and TV series from movy.sx and NetMirror"
+    description = "Movies and TV series from movy.sx, NetMirror, and Bingr"
     authors = listOf("HrishikeshBhandarkar")
     status = 1
     tvTypes = listOf("Movie", "TvSeries")
