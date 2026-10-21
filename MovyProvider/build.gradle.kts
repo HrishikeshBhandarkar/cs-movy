@@ -2,7 +2,7 @@ version = 4
 
 cloudstream {
     description = "Movies and TV series from movy.sx and NetMirror"
-    authors = listOf("opencode")
+    authors = listOf("HrishikeshBhandarkar")
     status = 1
     tvTypes = listOf("Movie", "TvSeries")
     language = "en"
