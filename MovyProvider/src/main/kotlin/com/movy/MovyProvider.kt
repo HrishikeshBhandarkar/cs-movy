@@ -224,9 +224,12 @@ class MovyProvider : MainAPI() {
 
         val loadUrl = "$mainUrl/$type/$id"
 
+        val encodedTitle = encodeComponent(title)
+        val yearStr = year?.toString().orEmpty()
+
         if (type == "movie") {
             val runtime = detail.optInt("runtime", 0).takeIf { it > 0 }
-            return newMovieLoadResponse(title, loadUrl, TvType.Movie, "movie|$id") {
+            return newMovieLoadResponse(title, loadUrl, TvType.Movie, "movie|$id|0|0|$encodedTitle|$yearStr") {
                 this.posterUrl = poster
                 this.backgroundPosterUrl = backdrop
                 this.logoUrl = logoUrl
@@ -254,7 +257,7 @@ class MovyProvider : MainAPI() {
                 val epPlot = ep.str("overview")
                 val epRatingValue = ep.optDouble("vote_average", 0.0)
                 val epRating = if (epRatingValue > 0) Score.from10(epRatingValue) else null
-                episodes.add(newEpisode(data = "tv|$id|$season|$number") {
+                episodes.add(newEpisode(data = "tv|$id|$season|$number|$encodedTitle|$yearStr") {
                     this.name = epName
                     this.season = season
                     this.episode = number
@@ -292,8 +295,8 @@ class MovyProvider : MainAPI() {
             val parts = data.split("|")
             type = parts.getOrNull(0)?.substringAfterLast("/")?.trimEnd('/') ?: return false
             id = parts.getOrNull(1)?.toIntOrNull() ?: return false
-            season = parts.getOrNull(2)?.toIntOrNull()
-            episode = parts.getOrNull(3)?.toIntOrNull()
+            season = parts.getOrNull(2)?.toIntOrNull()?.takeIf { it > 0 }
+            episode = parts.getOrNull(3)?.toIntOrNull()?.takeIf { it > 0 }
         } else {
             val match = Regex("""(?:^|/)(movie|tv)/(\d+)""").find(data) ?: return false
             type = match.groupValues[1]
@@ -441,9 +444,16 @@ class MovyProvider : MainAPI() {
         Log.d(TAG, "NetMirror stage done found=$netMirrorFound")
 
         Log.d(TAG, "starting Bingr")
+        val bingrData = if (data.contains("|") && data.split("|").size >= 5) {
+            data
+        } else {
+            val s = season ?: 0
+            val e = episode ?: 0
+            "$type|$id|$s|$e|${encodeComponent(title)}|${year ?: ""}"
+        }
         val bingrFound = runCatching {
             bingr.loadLinks(
-                data = data,
+                data = bingrData,
                 isCasting = isCasting,
                 subtitleCallback = { subtitle ->
                     if (seenSubtitles.add(subtitle.url)) subtitleCallback.invoke(subtitle)

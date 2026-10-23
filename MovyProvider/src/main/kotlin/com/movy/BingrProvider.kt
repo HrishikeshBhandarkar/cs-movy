@@ -30,6 +30,8 @@ import com.lagradost.nicehttp.RequestBodyTypes
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.net.URLDecoder
+import java.net.URLEncoder
 
 class BingrProvider : MainAPI() {
     override var mainUrl = "https://bingr.one"
@@ -48,20 +50,19 @@ class BingrProvider : MainAPI() {
         val type: String,
         val id: Int,
         val season: Int? = null,
-        val episode: Int? = null
+        val episode: Int? = null,
+        val title: String? = null,
+        val year: Int? = null
     )
 
     private data class StreamResult(val server: Server, val json: JSONObject)
 
     private val servers = listOf(
-        Server("s40", "Aphelion"),
         Server("s70", "Polaris"),
+        Server("s40", "Aphelion"),
         Server("s80", "Moscow"),
         Server("s81", "Novo"),
-        Server("s62", "Bastion"),
-        Server("s30", "Nova"),
-        Server("s61", "Corvus"),
-        Server("s31", "Orion")
+        Server("s62", "Bastion")
     )
 
     private val headers = mapOf(
@@ -151,11 +152,18 @@ class BingrProvider : MainAPI() {
                 ?.takeIf { it == "movie" || it == "tv" }
                 ?: return null
             val id = parts.getOrNull(1)?.toIntOrNull() ?: return null
+            val season = parts.getOrNull(2)?.toIntOrNull()?.takeIf { it > 0 }
+            val episode = parts.getOrNull(3)?.toIntOrNull()?.takeIf { it > 0 }
+            val rawTitle = parts.getOrNull(4)?.takeIf { it.isNotBlank() }
+            val title = rawTitle?.let { runCatching { URLDecoder.decode(it, "UTF-8") }.getOrDefault(it) }
+            val year = parts.getOrNull(5)?.toIntOrNull()
             return LinkData(
                 type = type,
                 id = id,
-                season = parts.getOrNull(2)?.toIntOrNull(),
-                episode = parts.getOrNull(3)?.toIntOrNull()
+                season = season,
+                episode = episode,
+                title = title,
+                year = year
             )
         }
 
@@ -243,9 +251,11 @@ class BingrProvider : MainAPI() {
         }.orEmpty()
 
         val loadUrl = "$mainUrl/$type/${link.id}"
+        val encodedTitle = URLEncoder.encode(title, "UTF-8")
+        val yearStr = year?.toString().orEmpty()
 
         if (type == "movie") {
-            return newMovieLoadResponse(title, loadUrl, TvType.Movie, "movie|${link.id}") {
+            return newMovieLoadResponse(title, loadUrl, TvType.Movie, "movie|${link.id}|0|0|$encodedTitle|$yearStr") {
                 this.posterUrl = poster
                 this.backgroundPosterUrl = backdrop
                 this.logoUrl = logo
@@ -283,7 +293,7 @@ class BingrProvider : MainAPI() {
                         val number = ep.optInt("episode", 0)
                         if (number <= 0) continue
                         val episodeRating = ep.optDouble("rating", 0.0)
-                        episodes.add(newEpisode(data = "tv|${link.id}|$season|$number") {
+                        episodes.add(newEpisode(data = "tv|${link.id}|$season|$number|$encodedTitle|$yearStr") {
                             this.name = ep.str("title") ?: "Episode $number"
                             this.season = season
                             this.episode = number
@@ -295,7 +305,7 @@ class BingrProvider : MainAPI() {
                 } else {
                     val count = seasonObj.optInt("episodes", 0)
                     for (number in 1..count) {
-                        episodes.add(newEpisode(data = "tv|${link.id}|$season|$number") {
+                        episodes.add(newEpisode(data = "tv|${link.id}|$season|$number|$encodedTitle|$yearStr") {
                             this.name = "Episode $number"
                             this.season = season
                             this.episode = number
@@ -379,18 +389,22 @@ class BingrProvider : MainAPI() {
             Log.d(TAG, "Unable to parse link data: $data")
             return false
         }
-        val detail = fetchDetail(link.type, link.id) ?: run {
-            Log.d(TAG, "Detail unavailable for ${link.type}/${link.id}")
-            return false
+        val (title, year) = if (!link.title.isNullOrBlank()) {
+            link.title to link.year
+        } else {
+            val detail = fetchDetail(link.type, link.id)
+            val dTitle = detail?.str("title") ?: detail?.str("name")
+            val dYear = detail?.str("year")?.toIntOrNull()
+            dTitle to dYear
         }
-        val title = detail.str("title") ?: detail.str("name") ?: run {
-            Log.d(TAG, "Detail has no title for ${link.type}/${link.id}")
+        if (title.isNullOrBlank()) {
+            Log.d(TAG, "Title unavailable for ${link.type}/${link.id}")
             return false
         }
 
         val query = JSONObject()
             .put("title", title)
-        detail.str("year")?.let { query.put("year", it) }
+        year?.let { query.put("year", it.toString()) }
         if (link.type == "tv") {
             query.put("season", (link.season ?: 1).toString())
             query.put("episode", (link.episode ?: 1).toString())

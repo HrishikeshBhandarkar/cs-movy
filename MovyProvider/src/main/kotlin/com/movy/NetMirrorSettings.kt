@@ -5,8 +5,10 @@ import android.app.AlertDialog
 import android.app.Application
 import android.app.Dialog
 import android.content.Context
+import android.content.ClipboardManager
 import android.content.ContextWrapper
 import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -79,6 +81,105 @@ object NetMirrorSettings {
                 }
             )
         }
+    }
+
+    fun openManageDialog(context: Context) {
+        val activity = resolveActivity(context) ?: return
+        runOnUi {
+            if (activity.isFinishing || activity.isDestroyed) return@runOnUi
+            showManageDialog(activity)
+        }
+    }
+
+    private fun showManageDialog(activity: Activity) {
+        val currentToken = NetMirrorStore.userToken()
+        val hasToken = !currentToken.isNullOrBlank()
+
+        val density = activity.resources.displayMetrics.density
+        val pad = (16 * density).toInt()
+        val smallPad = (8 * density).toInt()
+
+        val root = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+        }
+
+        val statusText = TextView(activity).apply {
+            text = if (hasToken) {
+                "Status: Active (Cookie present; expires in 24h)"
+            } else {
+                "Status: Missing or Expired"
+            }
+            setTextColor(if (hasToken) Color.rgb(46, 125, 50) else Color.rgb(198, 40, 40))
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setPadding(0, 0, 0, smallPad)
+        }
+        root.addView(statusText)
+
+        val descText = TextView(activity).apply {
+            text = "NetMirror cookies expire every 24 hours. You can replace or paste your fresh user_token / cookie header below at any time."
+            setTextColor(Color.DKGRAY)
+            textSize = 12f
+            setPadding(0, 0, 0, smallPad)
+        }
+        root.addView(descText)
+
+        val input = EditText(activity).apply {
+            hint = "user_token=... or raw token value"
+            if (hasToken) {
+                setText(currentToken)
+            }
+            minLines = 3
+            textSize = 13f
+            setBackgroundResource(android.R.drawable.edit_text)
+            setPadding(smallPad * 2, smallPad * 2, smallPad * 2, smallPad * 2)
+        }
+        root.addView(input)
+
+        val btnRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, smallPad, 0, 0)
+        }
+
+        val pasteClipBtn = Button(activity).apply {
+            text = "Paste from Clipboard"
+            setOnClickListener {
+                val clipMgr = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                val clipText = clipMgr?.primaryClip?.getItemAt(0)?.text?.toString()?.trim()
+                if (!clipText.isNullOrBlank()) {
+                    input.setText(clipText)
+                    Toast.makeText(activity, "Pasted from clipboard", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(activity, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        btnRow.addView(pasteClipBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(btnRow)
+
+        AlertDialog.Builder(activity)
+            .setTitle("NetMirror Cookie Manager")
+            .setView(root)
+            .setPositiveButton("Save & Replace") { _, _ ->
+                val text = input.text?.toString().orEmpty()
+                NetMirrorStore.saveUserToken(text)
+                val saved = NetMirrorStore.userToken()
+                Toast.makeText(
+                    activity,
+                    if (saved == null) "Token was empty" else "NetMirror cookie saved & replaced!",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            .setNeutralButton("Webview Login") { _, _ ->
+                loginShowing = true
+                openLogin(activity, null)
+            }
+            .setNegativeButton("Clear") { _, _ ->
+                NetMirrorStore.clear()
+                Toast.makeText(activity, "NetMirror session cleared", Toast.LENGTH_SHORT).show()
+            }
+            .show()
     }
 
     fun show(context: Context) {

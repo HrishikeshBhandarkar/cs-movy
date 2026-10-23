@@ -2,24 +2,77 @@ package com.movy
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Environment
 import org.json.JSONObject
+import java.io.File
 
 object NetMirrorStore {
     private const val PREFS = "netmirror_session"
     private const val KEY = "cookies"
+    private const val KEY_TIMESTAMP = "file_timestamp"
+    private const val SHARED_FILE_NAME = ".netmirror_session"
 
     @Volatile
     private var appContext: Context? = null
 
     fun init(context: Context) {
         appContext = context.applicationContext
+        // Attempt initial sync from shared file if local prefs are empty or file is newer
+        syncFromSharedFileIfNeeded()
     }
 
     private fun prefs(): SharedPreferences? =
         appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
+    private fun sharedFile(): File? = try {
+        val csDir = File("/storage/emulated/0/Cloudstream3")
+        if (!csDir.exists()) csDir.mkdirs()
+        File(csDir, SHARED_FILE_NAME)
+    } catch (t: Throwable) {
+        try {
+            val download = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            File(download, SHARED_FILE_NAME)
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    private fun syncFromSharedFileIfNeeded() {
+        val file = sharedFile() ?: return
+        if (!file.exists() || !file.canRead()) return
+
+        val fileMod = file.lastModified()
+        val localMod = prefs()?.getLong(KEY_TIMESTAMP, 0L) ?: 0L
+        val current = prefs()?.getString(KEY, null)
+
+        if (current.isNullOrBlank() || fileMod > localMod) {
+            runCatching {
+                val text = file.readText(Charsets.UTF_8).trim()
+                if (text.isNotBlank() && text.startsWith("{")) {
+                    prefs()?.edit()
+                        ?.putString(KEY, text)
+                        ?.putLong(KEY_TIMESTAMP, fileMod)
+                        ?.apply()
+                }
+            }
+        }
+    }
+
+    private fun saveToSharedFile(jsonStr: String) {
+        try {
+            val file = sharedFile() ?: return
+            file.writeText(jsonStr, Charsets.UTF_8)
+            prefs()?.edit()?.putLong(KEY_TIMESTAMP, file.lastModified())?.apply()
+        } catch (t: Throwable) {
+            // Non-critical if external storage permission is restricted
+        }
+    }
+
     fun cookies(): MutableMap<String, String> {
-        val raw = prefs()?.getString(KEY, null) ?: return mutableMapOf()
+        syncFromSharedFileIfNeeded()
+        val raw = prefs()?.getString(KEY, null)
+        if (raw.isNullOrBlank()) return mutableMapOf()
+
         return runCatching {
             val json = JSONObject(raw)
             val result = mutableMapOf<String, String>()
@@ -44,7 +97,9 @@ object NetMirrorStore {
         values.forEach { (key, value) ->
             if (value.isNotBlank()) json.put(key, value)
         }
-        prefs()?.edit()?.putString(KEY, json.toString())?.apply()
+        val str = json.toString()
+        prefs()?.edit()?.putString(KEY, str)?.apply()
+        saveToSharedFile(str)
     }
 
     fun saveCookieHeader(header: String?) {
@@ -77,7 +132,10 @@ object NetMirrorStore {
     }
 
     fun clear() {
-        prefs()?.edit()?.remove(KEY)?.apply()
+        prefs()?.edit()?.remove(KEY)?.remove(KEY_TIMESTAMP)?.apply()
+        try {
+            sharedFile()?.delete()
+        } catch (t: Throwable) {}
     }
 
     fun userToken(): String? = cookies()["user_token"]?.takeIf { it.isNotBlank() }

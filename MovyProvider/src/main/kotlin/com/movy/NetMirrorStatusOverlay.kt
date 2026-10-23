@@ -73,15 +73,7 @@ class NetMirrorStatusOverlay private constructor(
             isClickable = true
             isFocusable = true
             setOnClickListener {
-                when (currentStatus()) {
-                    Status.READY -> NetMirrorSettings.show(context)
-                    Status.VERIFY -> NetMirrorSettings.showLogin(
-                        "NetMirror cookie expired or unverified. Complete the reCAPTCHA and log in."
-                    )
-                    Status.LOGIN -> NetMirrorSettings.showLogin(
-                        "Log in to NetMirror to unlock playback."
-                    )
-                }
+                NetMirrorSettings.openManageDialog(context)
             }
         }
         val params = FrameLayout.LayoutParams(
