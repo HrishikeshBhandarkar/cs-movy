@@ -1,5 +1,8 @@
 name: Build
 
+permissions:
+  contents: write
+
 # https://docs.github.com/en/actions/learn-github-actions/workflow-syntax-for-github-actions#concurrency
 concurrency: 
   group: "build"
@@ -28,6 +31,7 @@ jobs:
         with:
           ref: "builds"
           path: "builds"
+          token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Clean old builds
         run: rm -f $GITHUB_WORKSPACE/builds/*.cs3
