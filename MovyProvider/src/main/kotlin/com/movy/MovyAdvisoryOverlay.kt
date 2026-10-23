@@ -1,5 +1,7 @@
 package com.movy
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
 import android.app.Activity
@@ -38,20 +40,24 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Netflix-style content advisory overlay for the CloudStream player.
  *
- * Sequence:
+ * Sequence & Behavior:
  *  1. Main Content Advisory:
- *     - Dynamic accent ribbon scales in vertically
- *     - Rating ("RATED <badge>") and content reasons slide out of the mask
- *     - Holds, then retracts into the mask and collapses
+ *     - Dynamic accent ribbon scales in vertically from its center
+ *     - Rating badge ("RATED <badge>") and content reasons slide out of the clipping mask
+ *     - Holds for exactly 3 seconds after in-animation finishes
+ *     - Retracts into mask and ribbon collapses
  *  2. Statutory Anti-Tobacco Advisory (if item contains smoking/tobacco depictions):
  *     - Separate entity shown after main advisory closes
- *     - Clean single-line warning: "Consumption of tobacco products is injurious to health"
- *     - If interrupted, only the currently active advisory entity is reshowed
+ *     - Ribbon scales in from the EXACT SAME middle location
+ *     - Holds for exactly 3 seconds after in-animation finishes
+ *     - Retracts and collapses
  *
- * Features real rating and descriptor fetching via TMDB and OMDB APIs with smart fallback.
+ *  - Automatically resets and displays on every episode transition / change.
+ *  - Immediately terminates if video is buffering, paused, or seeking, and resumes when normal playback returns.
+ *  - Real ratings fetched dynamically via TMDB & OMDB with smart tag/genre inference.
  */
 class MovyAdvisoryOverlay private constructor(
-    private val app: Application
+    private val appInstance: Application
 ) : Application.ActivityLifecycleCallbacks {
 
     private val handler = Handler(Looper.getMainLooper())
@@ -63,8 +69,10 @@ class MovyAdvisoryOverlay private constructor(
 
     private var mainState = AdvisoryState.NOT_SHOWN
     private var tobaccoState = AdvisoryState.NOT_SHOWN
-    private var hasTobacco = true
+    private var hasTobacco = false
+
     private var lastResolvedTitle: String? = null
+    private var lastEpisodeKey: String? = null
 
     private var controlsVisible = false
     private var playbackRunning = false
@@ -74,17 +82,16 @@ class MovyAdvisoryOverlay private constructor(
     private var playerFragment: Any? = null
     private var playerFragmentAt = 0L
     private var lastHeartbeatMs = 0L
+    private var lockedRibbonHeight = 0
 
     private var enterSet: AnimatorSet? = null
     private var exitSet: AnimatorSet? = null
-    private var sequenceToken: Any? = null
-
     private var tobaccoEnterSet: AnimatorSet? = null
     private var tobaccoExitSet: AnimatorSet? = null
-    private var tobaccoToken: Any? = null
 
     private enum class AdvisoryState {
         NOT_SHOWN,
+        QUEUED,
         SHOWING,
         DONE,
         INTERRUPTED
@@ -254,6 +261,9 @@ class MovyAdvisoryOverlay private constructor(
             }
         })
 
+        // Pre-fetch metadata immediately upon attachment
+        prefetchAndApplyMetadata(overlay, playerFragment, player)
+
         handler.postAtTime(pollRunnable, activeSession, SystemClock.uptimeMillis())
 
         root.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
@@ -270,30 +280,50 @@ class MovyAdvisoryOverlay private constructor(
             ) {
                 if (bottom - top <= 0) return
                 v.post {
-                    syncRibbonHeight(overlay)
-                    syncTobaccoRibbonHeight(overlay)
+                    syncRibbonHeights(overlay)
                     sizeVignette(overlay, player)
                 }
             }
         })
     }
 
-    private fun syncRibbonHeight(overlay: OverlayViews) {
-        val height = overlay.mainCopy.height
-        if (height <= 0) return
-        val params = overlay.mainRibbon.layoutParams as? LinearLayout.LayoutParams ?: return
-        if (params.height == height) return
-        params.height = height
-        overlay.mainRibbon.layoutParams = params
-    }
+    /**
+     * Ensures both main and tobacco ribbons have the exact same height and center pivot.
+     * This guarantees the vertical middle point from which they expand is 100% IDENTICAL.
+     */
+    private fun syncRibbonHeights(overlay: OverlayViews) {
+        val context = overlay.root.context
+        val minHeight = dp(context, UNIFORM_BAR_HEIGHT_DP)
+        var copyHeight = overlay.mainCopy.height
+        if (copyHeight <= 0) {
+            copyHeight = overlay.mainCopy.measuredHeight
+        }
+        if (copyHeight > lockedRibbonHeight) {
+            lockedRibbonHeight = copyHeight
+        }
+        val uniformHeight = maxOf(minHeight, lockedRibbonHeight)
+        if (uniformHeight <= 0) return
 
-    private fun syncTobaccoRibbonHeight(overlay: OverlayViews) {
-        val height = overlay.tobaccoCopy.height
-        if (height <= 0) return
-        val params = overlay.tobaccoRibbon.layoutParams as? LinearLayout.LayoutParams ?: return
-        if (params.height == height) return
-        params.height = height
-        overlay.tobaccoRibbon.layoutParams = params
+        val p1 = overlay.mainRibbon.layoutParams as? LinearLayout.LayoutParams
+        if (p1 != null && p1.height != uniformHeight) {
+            p1.height = uniformHeight
+            overlay.mainRibbon.layoutParams = p1
+        }
+        overlay.mainRibbon.pivotY = uniformHeight / 2f
+        overlay.mainRibbon.pivotX = dpF(context, RIBBON_WIDTH_DP) / 2f
+
+        val p2 = overlay.tobaccoRibbon.layoutParams as? LinearLayout.LayoutParams
+        if (p2 != null && p2.height != uniformHeight) {
+            p2.height = uniformHeight
+            overlay.tobaccoRibbon.layoutParams = p2
+        }
+        overlay.tobaccoRibbon.pivotY = uniformHeight / 2f
+        overlay.tobaccoRibbon.pivotX = dpF(context, RIBBON_WIDTH_DP) / 2f
+
+        overlay.mainContainer.minimumHeight = uniformHeight
+        overlay.tobaccoContainer.minimumHeight = uniformHeight
+        overlay.mainCopy.minimumHeight = uniformHeight
+        overlay.tobaccoCopy.minimumHeight = uniformHeight
     }
 
     private fun sizeVignette(overlay: OverlayViews, player: ViewGroup) {
@@ -326,30 +356,23 @@ class MovyAdvisoryOverlay private constructor(
         overlay.vignette.layoutParams = params
     }
 
-    private fun ribbonHeight(overlay: OverlayViews): Float {
-        val h = maxOf(overlay.mainRibbon.height, overlay.mainCopy.height)
-        return if (h > 0) h.toFloat() else dp(overlay.mainCopy.context, 40).toFloat()
-    }
-
     private fun maskTravel(overlay: OverlayViews): Float {
         val w = maxOf(overlay.ratingRow.width, overlay.reasons.width)
         val width = if (w > 0) w.toFloat() else dp(overlay.mainCopy.context, 280).toFloat()
         return MASK_TRAVEL * width
     }
 
-    private fun tobaccoRibbonHeight(overlay: OverlayViews): Float {
-        val h = maxOf(overlay.tobaccoRibbon.height, overlay.tobaccoCopy.height)
-        return if (h > 0) h.toFloat() else dp(overlay.tobaccoCopy.context, 24).toFloat()
-    }
-
     private fun tobaccoMaskTravel(overlay: OverlayViews): Float {
-        val w = overlay.tobaccoText.width
-        val width = if (w > 0) w.toFloat() else dp(overlay.tobaccoCopy.context, 320).toFloat()
+        var w = overlay.tobaccoText.width
+        if (w <= 0) {
+            w = overlay.tobaccoText.measuredWidth
+        }
+        val width = if (w > 0) w.toFloat() else dp(overlay.tobaccoCopy.context, 260).toFloat()
         return MASK_TRAVEL * width
     }
 
     // ---------------------------------------------------------------------
-    // Playback / controls polling & State Machine
+    // Playback Polling, Buffering/Pause Handling & Episode Change Detection
     // ---------------------------------------------------------------------
 
     private fun tick(player: ViewGroup) {
@@ -358,6 +381,23 @@ class MovyAdvisoryOverlay private constructor(
         resolvePlayerFragment(activityRef?.get())
         val fragment = playerFragment
 
+        // 1. Detect Episode Transitions (Auto-play, next episode button, or manual selection)
+        val currentEpKey = getEpisodeIdentifier(fragment, player)
+        if (currentEpKey != null && currentEpKey != lastEpisodeKey) {
+            Log.i(TAG, "New episode detected ($lastEpisodeKey -> $currentEpKey): resetting advisories")
+            lastEpisodeKey = currentEpKey
+            resetForNewEpisode(player)
+            return
+        }
+
+        // Detect seek back to beginning (< 5s after past 15s)
+        val currentPos = playerPosition(player)
+        if (currentPos != null && currentPos < 5000L && lastPosition > 15000L) {
+            Log.i(TAG, "playback restarted from beginning: resetting advisories")
+            resetForNewEpisode(player)
+            return
+        }
+
         val running = isPlaybackRunning(player, fragment)
         if (running != playbackRunning) {
             playbackRunning = running
@@ -365,14 +405,24 @@ class MovyAdvisoryOverlay private constructor(
             Log.i(TAG, "playback running changed: $running (anchor=$playbackAnchorMs)")
         }
 
-        // Reset state on seek back to start or new video
-        val currentPos = playerPosition(player)
-        if (currentPos != null && currentPos < 5000L && lastPosition > 15000L) {
-            Log.i(TAG, "playback restarted: resetting advisory states")
-            mainState = AdvisoryState.NOT_SHOWN
-            tobaccoState = AdvisoryState.NOT_SHOWN
+        // 2. Terminate immediately if video is buffering, paused, or stopped!
+        if (!playbackRunning) {
+            if (mainState == AdvisoryState.SHOWING) {
+                stopAnimations()
+                hideAdvisoryViews()
+                mainState = AdvisoryState.INTERRUPTED
+                Log.i(TAG, "video buffering/paused: main advisory terminated")
+            }
+            if (tobaccoState == AdvisoryState.SHOWING || tobaccoState == AdvisoryState.QUEUED) {
+                stopTobaccoAnimations()
+                hideTobaccoViews()
+                tobaccoState = AdvisoryState.INTERRUPTED
+                Log.i(TAG, "video buffering/paused: tobacco advisory terminated")
+            }
+            return
         }
 
+        // 3. Terminate if player controls are opened
         val uiVisible = isPlayerUiVisible(fragment, player)
         if (uiVisible) {
             if (!controlsVisible) {
@@ -381,13 +431,13 @@ class MovyAdvisoryOverlay private constructor(
                     stopAnimations()
                     hideAdvisoryViews()
                     mainState = AdvisoryState.INTERRUPTED
-                    Log.i(TAG, "player controls shown, main advisory interrupted")
+                    Log.i(TAG, "player controls shown: main advisory terminated")
                 }
-                if (tobaccoState == AdvisoryState.SHOWING) {
+                if (tobaccoState == AdvisoryState.SHOWING || tobaccoState == AdvisoryState.QUEUED) {
                     stopTobaccoAnimations()
                     hideTobaccoViews()
                     tobaccoState = AdvisoryState.INTERRUPTED
-                    Log.i(TAG, "player controls shown, tobacco advisory interrupted")
+                    Log.i(TAG, "player controls shown: tobacco advisory terminated")
                 }
             }
             return
@@ -395,10 +445,10 @@ class MovyAdvisoryOverlay private constructor(
 
         if (controlsVisible) {
             controlsVisible = false
-            Log.i(TAG, "player controls hidden, advisory execution can proceed")
+            Log.i(TAG, "player controls hidden: advisory can resume/start")
         }
 
-        // Step 1: Main Advisory plays first
+        // 4. Execution State Machine (Only runs when playback is normal and controls are hidden)
         if (mainState != AdvisoryState.DONE) {
             if (mainState == AdvisoryState.NOT_SHOWN || mainState == AdvisoryState.INTERRUPTED) {
                 if (canStart(now)) {
@@ -406,9 +456,8 @@ class MovyAdvisoryOverlay private constructor(
                 }
             }
         } else if (hasTobacco && tobaccoState != AdvisoryState.DONE) {
-            // Step 2: Tobacco Advisory plays second as separate entity!
-            // If interrupted, ONLY this reshows!
-            if (tobaccoState == AdvisoryState.NOT_SHOWN || tobaccoState == AdvisoryState.INTERRUPTED) {
+            // Only resume if interrupted (QUEUED is handled exclusively by the delay timer)
+            if (tobaccoState == AdvisoryState.INTERRUPTED) {
                 if (canStart(now)) {
                     startTobaccoSequence()
                 }
@@ -429,10 +478,60 @@ class MovyAdvisoryOverlay private constructor(
     private fun canStart(now: Long): Boolean =
         playbackRunning && (now - playbackAnchorMs) >= START_DELAY_MS
 
+    private fun resetForNewEpisode(player: ViewGroup) {
+        stopAnimations()
+        stopTobaccoAnimations()
+        hideAdvisoryViews()
+        hideTobaccoViews()
+        mainState = AdvisoryState.NOT_SHOWN
+        tobaccoState = AdvisoryState.NOT_SHOWN
+        playbackAnchorMs = SystemClock.uptimeMillis()
+        lastPosition = -1L
+        lastResolvedTitle = null
+        lockedRibbonHeight = 0
+
+        overlayViews?.let { prefetchAndApplyMetadata(it, playerFragment, player) }
+    }
+
+    private fun getEpisodeIdentifier(fragment: Any?, player: ViewGroup?): String? {
+        if (fragment == null && player == null) return null
+        return try {
+            val viewModel = fragment?.let { invokeDeclared(it, "getViewModel") }
+            val state = viewModel?.let { invokeDeclared(it, "getState") }
+            val instance = state?.let { invokeDeclared(it, "getInstance") }
+            val genState = state?.let { invokeDeclared(it, "getGeneratorState") }
+            val epIndex = genState?.let { invokeDeclared(it, "getIndex") }
+            val epId = genState?.let { invokeDeclared(it, "getId") }
+            val meta = genState?.let { invokeDeclared(it, "getMeta") }
+            val metaEp = meta?.let { invokeDeclared(it, "getEpisode") }
+            val metaName = meta?.let { invokeDeclared(it, "getName") }
+
+            var playerTitle: String? = null
+            var playerSubTitle: String? = null
+            if (player != null) {
+                val res = player.resources
+                val pkg = player.context.packageName
+                val titleId = res.getIdentifier("player_video_title", "id", pkg)
+                if (titleId != 0) {
+                    playerTitle = player.findViewById<TextView?>(titleId)?.text?.toString()
+                }
+                val subTitleId = res.getIdentifier("player_video_sub_title", "id", pkg)
+                if (subTitleId != 0) {
+                    playerSubTitle = player.findViewById<TextView?>(subTitleId)?.text?.toString()
+                }
+            }
+
+            val key = "${instance}_${epIndex}_${epId}_${metaEp}_${metaName}_${playerTitle}_${playerSubTitle}".trim('_')
+            if (key.isNotBlank()) key else null
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
     private fun isPlaybackRunning(player: ViewGroup, fragment: Any?): Boolean {
         val status = playerStatusName(fragment)
+        if (status in listOf("IsBuffering", "IsPaused", "IsEnded", "IsStopped")) return false
         if (status == "IsPlaying") return true
-        if (status in listOf("IsBuffering", "IsPaused", "IsEnded")) return false
         if (fragmentIsPlaying(fragment)) return true
         if (exoPlayerIsPlaying(player)) return true
         return positionIsAdvancing(player)
@@ -720,77 +819,125 @@ class MovyAdvisoryOverlay private constructor(
     }
 
     // ---------------------------------------------------------------------
-    // Metadata & Real Ratings API
+    // Real Content Ratings API (TMDB & OMDB with Smart Inference)
     // ---------------------------------------------------------------------
 
-    private fun updateAdvisoryContent(overlay: OverlayViews, fragment: Any?) {
-        if (fragment == null) return
+    private fun prefetchAndApplyMetadata(overlay: OverlayViews, fragment: Any?, player: ViewGroup?) {
+        val (title, year, isTv, localRating, localTags, plot) = extractMetadata(fragment, player)
+        if (title.isBlank()) return
+
+        // 1. Initial immediate local inference
+        var ratingBadge = localRating
+        var descriptors: String? = null
+
+        if (ratingBadge.isNullOrBlank() && localTags.isNotEmpty()) {
+            val ratingRegex = Regex("^(TV-MA|TV-14|TV-PG|TV-G|TV-Y7|TV-Y|18\\+|16\\+|13\\+|12\\+|7\\+|R|PG-13|PG|G|NC-17|U/A.*|U|A)$", RegexOption.IGNORE_CASE)
+            ratingBadge = localTags.firstOrNull { it.matches(ratingRegex) }
+        }
+
+        if (localTags.isNotEmpty()) {
+            val cleanTags = localTags.filterNot { it.equals(ratingBadge, ignoreCase = true) }
+            if (cleanTags.isNotEmpty()) {
+                descriptors = cleanTags.take(3).joinToString(", ") { it.lowercase() }
+            }
+        }
+
+        // Tobacco detection from local metadata
+        val textToScan = (descriptors.orEmpty() + " " + localTags.joinToString() + " " + plot).lowercase()
+        hasTobacco = textToScan.contains("tobacco") || textToScan.contains("smoking") ||
+            textToScan.contains("cigarette") || textToScan.contains("cigar") ||
+            textToScan.contains("nicotine") || textToScan.contains("substance")
+
+        if (!ratingBadge.isNullOrBlank()) {
+            applyMainText(overlay, ratingBadge, descriptors)
+        } else {
+            // Apply smart default based on tags immediately so "RATED A" is never displayed as fallback!
+            val inferred = inferRatingFromTags(localTags, isTv)
+            applyMainText(overlay, inferred.first, inferred.second)
+        }
+
+        // 2. Fetch real metadata asynchronously in background thread
+        if (title != lastResolvedTitle) {
+            lastResolvedTitle = title
+            MetadataRatingFetcher.fetch(title, year, isTv) { result ->
+                Log.i(TAG, "Real API Rating resolved: badge=${result.ratingBadge}, desc=${result.descriptors}, tobacco=${result.hasTobacco}")
+                applyMainText(overlay, result.ratingBadge, result.descriptors)
+                if (result.hasTobacco) hasTobacco = true
+                syncRibbonHeights(overlay)
+            }
+        }
+    }
+
+    private data class ExtractedInfo(
+        val title: String,
+        val year: Int?,
+        val isTv: Boolean,
+        val contentRating: String?,
+        val tags: List<String>,
+        val plot: String
+    )
+
+    private fun extractMetadata(fragment: Any?, player: ViewGroup?): ExtractedInfo {
+        var title = ""
+        var year: Int? = null
+        var isTv = false
+        var contentRating: String? = null
+        val tags = mutableListOf<String>()
+        var plot = ""
+
         try {
-            val viewModel = invokeDeclared(fragment, "getViewModel") ?: return
-            val state = invokeDeclared(viewModel, "getState") ?: return
-            val genState = invokeDeclared(state, "getGeneratorState") ?: return
-            val response = invokeDeclared(genState, "getResponse") ?: return
+            val viewModel = fragment?.let { invokeDeclared(it, "getViewModel") }
+            val state = viewModel?.let { invokeDeclared(it, "getState") }
+            val genState = state?.let { invokeDeclared(it, "getGeneratorState") }
+            val response = genState?.let { invokeDeclared(it, "getResponse") }
+            val meta = genState?.let { invokeDeclared(it, "getMeta") }
 
-            val title = (invokeDeclared(response, "getName") as? String)?.trim().orEmpty()
-            val year = invokeDeclared(response, "getYear") as? Int
-            val typeStr = invokeDeclared(response, "getType")?.toString().orEmpty()
-            val isTv = typeStr.contains("Tv", ignoreCase = true) || typeStr.contains("Series", ignoreCase = true)
-            val contentRating = (invokeDeclared(response, "getContentRating") as? String)?.trim()
-            val tags = invokeDeclared(response, "getTags") as? List<*>
-            val plot = (invokeDeclared(response, "getPlot") as? String).orEmpty()
-
-            // 1. Initial immediate local resolution from LoadResponse
-            var ratingBadge: String? = null
-            var descriptors: String? = null
-
-            if (!contentRating.isNullOrBlank()) {
-                val delimiters = Regex("[,|:•–-]")
-                if (contentRating.contains(delimiters)) {
-                    val parts = contentRating.split(delimiters, limit = 2).map { it.trim() }
-                    ratingBadge = parts.getOrNull(0)
-                    descriptors = parts.getOrNull(1)
-                } else {
-                    ratingBadge = contentRating
-                }
+            if (response != null) {
+                title = (invokeDeclared(response, "getName") as? String).orEmpty()
+                year = invokeDeclared(response, "getYear") as? Int
+                val typeStr = invokeDeclared(response, "getType")?.toString().orEmpty()
+                isTv = typeStr.contains("Tv", ignoreCase = true) || typeStr.contains("Series", ignoreCase = true)
+                contentRating = (invokeDeclared(response, "getContentRating") as? String)?.trim()
+                (invokeDeclared(response, "getTags") as? List<*>)?.mapNotNullTo(tags) { it?.toString()?.trim() }
+                plot = (invokeDeclared(response, "getPlot") as? String).orEmpty()
             }
 
-            if (ratingBadge.isNullOrBlank() && !tags.isNullOrEmpty()) {
-                val ratingRegex = Regex("^(TV-MA|TV-14|TV-PG|TV-G|TV-Y7|TV-Y|18\\+|16\\+|13\\+|12\\+|7\\+|R|PG-13|PG|G|NC-17|U/A.*|U|A)$", RegexOption.IGNORE_CASE)
-                val matchedTag = tags.firstOrNull { it?.toString()?.trim()?.matches(ratingRegex) == true }
-                if (matchedTag != null) ratingBadge = matchedTag.toString().trim()
+            if (title.isBlank() && meta != null) {
+                val header = invokeDeclared(meta, "getHeaderName") as? String
+                val name = invokeDeclared(meta, "getName") as? String
+                title = header ?: name.orEmpty()
             }
 
-            if (descriptors.isNullOrBlank() && !tags.isNullOrEmpty()) {
-                val filteredTags = tags.mapNotNull { it?.toString()?.trim() }
-                    .filterNot { it.equals(ratingBadge, ignoreCase = true) }
-                    .take(4)
-                if (filteredTags.isNotEmpty()) {
-                    descriptors = filteredTags.joinToString(", ") { it.lowercase() }
-                }
-            }
-
-            // Check if tobacco is present in local data
-            val textToScan = (descriptors.orEmpty() + " " + tags?.joinToString() + " " + plot).lowercase()
-            hasTobacco = textToScan.contains("tobacco") || textToScan.contains("smoking") ||
-                textToScan.contains("cigarette") || textToScan.contains("cigar") ||
-                textToScan.contains("nicotine") || textToScan.contains("substance")
-
-            if (!ratingBadge.isNullOrBlank()) {
-                applyMainText(overlay, ratingBadge, descriptors)
-            }
-
-            // 2. Query Real Ratings API (TMDB / OMDB) in background if title is new
-            if (title.isNotBlank() && title != lastResolvedTitle) {
-                lastResolvedTitle = title
-                MetadataRatingFetcher.fetch(title, year, isTv) { result ->
-                    Log.i(TAG, "API Rating resolved: badge=${result.ratingBadge}, desc=${result.descriptors}, tobacco=${result.hasTobacco}")
-                    applyMainText(overlay, result.ratingBadge, result.descriptors)
-                    if (result.hasTobacco) hasTobacco = true
-                    syncRibbonHeight(overlay)
+            if (title.isBlank() && player != null) {
+                val res = player.resources
+                val pkg = player.context.packageName
+                val titleId = res.getIdentifier("player_video_title", "id", pkg)
+                if (titleId != 0) {
+                    title = player.findViewById<TextView?>(titleId)?.text?.toString().orEmpty()
                 }
             }
         } catch (t: Throwable) {
-            Log.d(TAG, "Could not extract metadata from player: ${t.message}")
+            Log.d(TAG, "extractMetadata failed: ${t.message}")
+        }
+
+        return ExtractedInfo(title.trim(), year, isTv, contentRating, tags, plot)
+    }
+
+    private fun inferRatingFromTags(tags: List<String>, isTv: Boolean): Pair<String, String> {
+        val t = tags.joinToString(" ").lowercase()
+        return when {
+            t.contains("horror") || t.contains("crime") || t.contains("thriller") -> {
+                (if (isTv) "TV-MA" else "R") to "violence, fear"
+            }
+            t.contains("action") || t.contains("war") -> {
+                (if (isTv) "TV-14" else "PG-13") to "violence, language"
+            }
+            t.contains("animation") || t.contains("family") || t.contains("comedy") -> {
+                (if (isTv) "TV-PG" else "PG") to "fear, mild themes"
+            }
+            else -> {
+                (if (isTv) "TV-14" else "PG-13") to "language, violence"
+            }
         }
     }
 
@@ -809,19 +956,20 @@ class MovyAdvisoryOverlay private constructor(
 
     private fun startSequence() {
         val overlay = overlayViews ?: return
-        val player = playerRef?.get()
+        val player = playerRef?.get() ?: return
         stopAnimations()
 
-        if (player != null) {
-            val accentColor = getAccentColor(player.context)
-            overlay.mainRibbon.setColor(accentColor)
-        }
+        val accentColor = getAccentColor(player.context)
+        overlay.mainRibbon.setColor(accentColor)
+        overlay.tobaccoRibbon.setColor(accentColor)
 
-        updateAdvisoryContent(overlay, playerFragment)
+        prefetchAndApplyMetadata(overlay, playerFragment, player)
+
+        // Hide tobacco container, prepare main views, then make visible
         overlay.tobaccoContainer.visibility = View.GONE
-        overlay.mainContainer.visibility = View.VISIBLE
-        syncRibbonHeight(overlay)
         prepareViews(overlay)
+        overlay.mainContainer.visibility = View.VISIBLE
+        syncRibbonHeights(overlay)
 
         overlay.vignette.elevation = 998f
         overlay.vignette.translationZ = 998f
@@ -831,53 +979,54 @@ class MovyAdvisoryOverlay private constructor(
         overlay.root.bringToFront()
 
         mainState = AdvisoryState.SHOWING
-        val token = Any()
-        sequenceToken = token
-
         Log.i(TAG, "main advisory choreography started! state=$mainState")
 
-        enterSet = buildEnterAnimators(overlay).also { it.start() }
-
-        handler.postAtTime(
-            Runnable {
-                if (mainState != AdvisoryState.SHOWING) return@Runnable
-                startExit(overlay)
-            },
-            token,
-            SystemClock.uptimeMillis() + EXIT_START_MS
-        )
+        enterSet = buildEnterAnimators(overlay).apply {
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (mainState != AdvisoryState.SHOWING) return
+                    // Hold for exactly 3 seconds after in-animation finishes!
+                    handler.postDelayed({
+                        if (mainState == AdvisoryState.SHOWING && !controlsVisible && playbackRunning) {
+                            startExit(overlay)
+                        }
+                    }, HOLD_MS)
+                }
+            })
+            start()
+        }
     }
 
     private fun startExit(overlay: OverlayViews) {
-        exitSet = buildExitAnimators(overlay).also { it.start() }
+        exitSet = buildExitAnimators(overlay).apply {
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (mainState != AdvisoryState.SHOWING) return
+                    hideAdvisoryViews()
+                    mainState = AdvisoryState.DONE
+                    Log.i(TAG, "main advisory choreography completed (state=DONE)")
 
-        handler.postAtTime(
-            Runnable {
-                if (mainState != AdvisoryState.SHOWING) return@Runnable
-                hideAdvisoryViews()
-                mainState = AdvisoryState.DONE
-                Log.i(TAG, "main advisory choreography completed (state=DONE)")
-
-                // After main advisory closes, if tobacco depiction is present, show statutory warning!
-                if (hasTobacco && tobaccoState == AdvisoryState.NOT_SHOWN) {
-                    handler.postDelayed({
-                        val p = playerRef?.get()
-                        if (p != null && isPlaybackRunning(p, playerFragment) && !controlsVisible) {
-                            startTobaccoSequence()
-                        }
-                    }, TOBACCO_GAP_AFTER_MAIN_MS)
+                    // If tobacco depiction exists, queue the statutory anti-tobacco advisory smoothly
+                    if (hasTobacco && tobaccoState == AdvisoryState.NOT_SHOWN) {
+                        tobaccoState = AdvisoryState.QUEUED
+                        handler.postDelayed({
+                            if (tobaccoState != AdvisoryState.QUEUED) return@postDelayed
+                            val p = playerRef?.get()
+                            if (p != null && isPlaybackRunning(p, playerFragment) && !controlsVisible) {
+                                startTobaccoSequence()
+                            } else {
+                                tobaccoState = AdvisoryState.INTERRUPTED
+                            }
+                        }, TOBACCO_GAP_AFTER_MAIN_MS)
+                    }
                 }
-            },
-            sequenceToken,
-            SystemClock.uptimeMillis() + EXIT_TOTAL_MS
-        )
+            })
+            start()
+        }
     }
 
     private fun prepareViews(overlay: OverlayViews) {
         val travel = maskTravel(overlay)
-        val h = ribbonHeight(overlay)
-
-        overlay.mainRibbon.pivotY = h / 2f
         overlay.mainRibbon.scaleY = 0f
         overlay.mainRibbon.alpha = 0f
 
@@ -1010,8 +1159,6 @@ class MovyAdvisoryOverlay private constructor(
         enterSet = null
         exitSet?.cancel()
         exitSet = null
-        sequenceToken?.let { handler.removeCallbacksAndMessages(it) }
-        sequenceToken = null
     }
 
     // ---------------------------------------------------------------------
@@ -1020,64 +1167,69 @@ class MovyAdvisoryOverlay private constructor(
 
     private fun startTobaccoSequence() {
         val overlay = overlayViews ?: return
-        val player = playerRef?.get()
+        val player = playerRef?.get() ?: return
         stopTobaccoAnimations()
 
-        if (player != null) {
-            val accentColor = getAccentColor(player.context)
-            overlay.tobaccoRibbon.setColor(accentColor)
-        }
+        val accentColor = getAccentColor(player.context)
+        overlay.tobaccoRibbon.setColor(accentColor)
 
+        // Hide main container, sync heights, and prepare views BEFORE setting visible to prevent any 1-frame glitch!
         overlay.mainContainer.visibility = View.GONE
-        overlay.tobaccoContainer.visibility = View.VISIBLE
-        syncTobaccoRibbonHeight(overlay)
+        syncRibbonHeights(overlay)
         prepareTobaccoViews(overlay)
+        overlay.tobaccoContainer.visibility = View.VISIBLE
 
         overlay.vignette.elevation = 998f
         overlay.vignette.translationZ = 998f
-        overlay.root.elevation = 999f
-        overlay.root.translationZ = 999f
+        overlay.tobaccoContainer.elevation = 999f
+        overlay.tobaccoContainer.translationZ = 999f
         overlay.vignette.bringToFront()
-        overlay.root.bringToFront()
+        overlay.tobaccoContainer.bringToFront()
 
         tobaccoState = AdvisoryState.SHOWING
-        val token = Any()
-        tobaccoToken = token
-
         Log.i(TAG, "tobacco advisory sequence started! state=$tobaccoState")
 
-        tobaccoEnterSet = buildTobaccoEnterAnimators(overlay).also { it.start() }
-
-        handler.postAtTime(
-            Runnable {
-                if (tobaccoState != AdvisoryState.SHOWING) return@Runnable
-                startTobaccoExit(overlay)
-            },
-            token,
-            SystemClock.uptimeMillis() + TOBACCO_EXIT_START_MS
-        )
+        overlay.tobaccoContainer.post {
+            if (tobaccoState != AdvisoryState.SHOWING) return@post
+            val p = playerRef?.get() ?: return@post
+            if (!isPlaybackRunning(p, playerFragment) || controlsVisible) {
+                tobaccoState = AdvisoryState.INTERRUPTED
+                return@post
+            }
+            prepareTobaccoViews(overlay)
+            tobaccoEnterSet = buildTobaccoEnterAnimators(overlay).apply {
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        if (tobaccoState != AdvisoryState.SHOWING) return
+                        // Hold for exactly 3 seconds after in-animation finishes!
+                        handler.postDelayed({
+                            if (tobaccoState == AdvisoryState.SHOWING && !controlsVisible && playbackRunning) {
+                                startTobaccoExit(overlay)
+                            }
+                        }, HOLD_MS)
+                    }
+                })
+                start()
+            }
+        }
     }
 
     private fun startTobaccoExit(overlay: OverlayViews) {
-        tobaccoExitSet = buildTobaccoExitAnimators(overlay).also { it.start() }
-
-        handler.postAtTime(
-            Runnable {
-                if (tobaccoState != AdvisoryState.SHOWING) return@Runnable
-                hideTobaccoViews()
-                tobaccoState = AdvisoryState.DONE
-                Log.i(TAG, "tobacco advisory completed (state=DONE)")
-            },
-            tobaccoToken,
-            SystemClock.uptimeMillis() + TOBACCO_EXIT_TOTAL_MS
-        )
+        tobaccoExitSet = buildTobaccoExitAnimators(overlay).apply {
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (tobaccoState != AdvisoryState.SHOWING) return
+                    hideTobaccoViews()
+                    tobaccoState = AdvisoryState.DONE
+                    Log.i(TAG, "tobacco advisory completed (state=DONE)")
+                }
+            })
+            start()
+        }
     }
 
     private fun prepareTobaccoViews(overlay: OverlayViews) {
         val travel = tobaccoMaskTravel(overlay)
-        val h = tobaccoRibbonHeight(overlay)
-
-        overlay.tobaccoRibbon.pivotY = h / 2f
         overlay.tobaccoRibbon.scaleY = 0f
         overlay.tobaccoRibbon.alpha = 0f
 
@@ -1169,8 +1321,6 @@ class MovyAdvisoryOverlay private constructor(
         tobaccoEnterSet = null
         tobaccoExitSet?.cancel()
         tobaccoExitSet = null
-        tobaccoToken?.let { handler.removeCallbacksAndMessages(it) }
-        tobaccoToken = null
     }
 
     private fun removeExistingCard() {
@@ -1197,6 +1347,8 @@ class MovyAdvisoryOverlay private constructor(
         controlsVisible = false
         playbackRunning = false
         lastPosition = -1L
+        lastEpisodeKey = null
+        lastResolvedTitle = null
     }
 
     private fun detach() {
@@ -1211,11 +1363,13 @@ class MovyAdvisoryOverlay private constructor(
         controlsVisible = false
         playbackRunning = false
         lastPosition = -1L
+        lastEpisodeKey = null
+        lastResolvedTitle = null
         removeExistingCard()
     }
 
     // ---------------------------------------------------------------------
-    // View Construction - Restored original placement & text sizing
+    // View Construction - Exact Same Middle Point Anchor for Both Advisories
     // ---------------------------------------------------------------------
 
     private fun buildOverlay(context: Context, player: ViewGroup): OverlayViews {
@@ -1232,9 +1386,12 @@ class MovyAdvisoryOverlay private constructor(
             isFocusable = false
         }
 
-        // 1. Main Advisory Container
+        val accentColor = getAccentColor(player.context)
+
+        // 1. Main Content Advisory Container
         val mainContainer = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             clipChildren = false
             isClickable = false
             isFocusable = false
@@ -1242,7 +1399,6 @@ class MovyAdvisoryOverlay private constructor(
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
         }
 
-        val accentColor = getAccentColor(player.context)
         val mainRibbon = RibbonView(
             context,
             dpF(context, RIBBON_WIDTH_DP).toFloat(),
@@ -1277,7 +1433,7 @@ class MovyAdvisoryOverlay private constructor(
         }
 
         val rating = TextView(context).apply {
-            text = DEMO_RATING
+            text = ""
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, ratingTextSp)
             typeface = Typeface.create("sans-serif", Typeface.BOLD)
@@ -1288,7 +1444,7 @@ class MovyAdvisoryOverlay private constructor(
         }
 
         val reasons = TextView(context).apply {
-            text = DEMO_TEXT
+            text = ""
             setTextColor(REASON_COLOR)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, reasonTextSp)
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
@@ -1328,7 +1484,7 @@ class MovyAdvisoryOverlay private constructor(
 
         mainContainer.addView(mainRibbon, LinearLayout.LayoutParams(
             dpF(context, RIBBON_WIDTH_DP),
-            LinearLayout.LayoutParams.WRAP_CONTENT
+            dp(context, UNIFORM_BAR_HEIGHT_DP)
         ))
         mainContainer.addView(mainCopy, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -1337,11 +1493,10 @@ class MovyAdvisoryOverlay private constructor(
             marginStart = dp(context, MASK_GAP_DP)
         })
 
-        mainContainer.contentDescription = "Content advisory: $DEMO_PREFIX $DEMO_RATING, $DEMO_TEXT"
-
-        // 2. Statutory Anti-Tobacco Advisory Container (Separate Entity)
+        // 2. Statutory Anti-Tobacco Advisory Container (Exact same middle anchor & height)
         val tobaccoContainer = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             clipChildren = false
             isClickable = false
             isFocusable = false
@@ -1388,7 +1543,7 @@ class MovyAdvisoryOverlay private constructor(
 
         tobaccoContainer.addView(tobaccoRibbon, LinearLayout.LayoutParams(
             dpF(context, RIBBON_WIDTH_DP),
-            LinearLayout.LayoutParams.WRAP_CONTENT
+            dp(context, UNIFORM_BAR_HEIGHT_DP)
         ))
         tobaccoContainer.addView(tobaccoCopy, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -1399,7 +1554,6 @@ class MovyAdvisoryOverlay private constructor(
 
         tobaccoContainer.contentDescription = "Content advisory: $TOBACCO_WARNING_TEXT"
 
-        // Add both containers to the common root
         root.addView(mainContainer, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
@@ -1409,7 +1563,6 @@ class MovyAdvisoryOverlay private constructor(
             FrameLayout.LayoutParams.WRAP_CONTENT
         ))
 
-        // Hidden until sequences start
         mainRibbon.alpha = 0f
         ratingRow.alpha = 0f
         reasons.alpha = 0f
@@ -1436,9 +1589,6 @@ class MovyAdvisoryOverlay private constructor(
         )
     }
 
-    /**
-     * Sleek, slender accent bar dynamically colored with CloudStream's theme accent color.
-     */
     private class RibbonView(
         context: Context,
         private val barWidth: Float,
@@ -1477,7 +1627,6 @@ class MovyAdvisoryOverlay private constructor(
         }
     }
 
-    /** Radial gradient that subtly darkens the top-left corner for high text contrast. */
     private class CornerVignetteView(context: Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private var shader: RadialGradient? = null
@@ -1533,28 +1682,23 @@ class MovyAdvisoryOverlay private constructor(
         minOf(maxSp, maxOf(minSp, widthDp * viewportRatio))
 
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
-
     override fun onActivityStarted(activity: Activity) = Unit
-
     override fun onActivityPaused(activity: Activity) {
         if (activityRef?.get() === activity) detach()
     }
-
     override fun onActivityStopped(activity: Activity) = Unit
-
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
-
     override fun onActivityDestroyed(activity: Activity) {
         if (activityRef?.get() === activity) detach()
     }
 
     // ---------------------------------------------------------------------
-    // Metadata / Rating API Fetcher (TMDB & OMDB)
+    // Metadata / Rating API Fetcher (TMDB & OMDB with Smart Inference)
     // ---------------------------------------------------------------------
 
     private object MetadataRatingFetcher {
         private const val TMDB_API_KEY = "e6333b32409e02a4a6eba6fb7ff866bb"
-        private const val OMDB_API_KEY = "b9a5e69d"
+        private val OMDB_API_KEYS = listOf("b9a5e69d", "720c3666", "564727fa")
         private val cache = ConcurrentHashMap<String, MetadataResult>()
 
         data class MetadataResult(
@@ -1598,125 +1742,136 @@ class MovyAdvisoryOverlay private constructor(
             .trim()
 
         private fun queryTmdb(title: String, year: Int?, isTv: Boolean): MetadataResult? {
-            val encoded = URLEncoder.encode(title, "UTF-8")
-            val searchUrl = "https://api.tmdb.org/3/search/multi?api_key=$TMDB_API_KEY&query=$encoded${if (year != null) "&year=$year" else ""}"
-            val jsonStr = httpGet(searchUrl) ?: return null
-            val root = JSONObject(jsonStr)
-            val results = root.optJSONArray("results") ?: return null
-            if (results.length() == 0) return null
-            val first = results.optJSONObject(0) ?: return null
-            val id = first.optInt("id", 0)
-            if (id == 0) return null
-            val mediaType = first.optString("media_type").ifBlank { if (isTv) "tv" else "movie" }
-            val overview = first.optString("overview", "").lowercase()
+            return try {
+                val encoded = URLEncoder.encode(title, "UTF-8")
+                val searchUrl = "https://api.tmdb.org/3/search/multi?api_key=$TMDB_API_KEY&query=$encoded"
+                val jsonStr = httpGet(searchUrl) ?: return null
+                val root = JSONObject(jsonStr)
+                val results = root.optJSONArray("results") ?: return null
+                if (results.length() == 0) return null
+                val first = results.optJSONObject(0) ?: return null
+                val id = first.optInt("id", 0)
+                if (id == 0) return null
+                val mediaType = first.optString("media_type").ifBlank { if (isTv) "tv" else "movie" }
+                val overview = first.optString("overview", "").lowercase()
 
-            var ratingBadge: String? = null
-            var hasTobacco = overview.contains("smoking") || overview.contains("tobacco") ||
-                overview.contains("cigarette") || overview.contains("cigar")
+                var ratingBadge: String? = null
+                var hasTobacco = overview.contains("smoking") || overview.contains("tobacco") ||
+                    overview.contains("cigarette") || overview.contains("cigar")
 
-            val keywordsList = mutableListOf<String>()
+                val keywordsList = mutableListOf<String>()
 
-            if (mediaType == "tv") {
-                val crJson = httpGet("https://api.tmdb.org/3/tv/$id/content_ratings?api_key=$TMDB_API_KEY")
-                if (crJson != null) {
-                    val crObj = JSONObject(crJson)
-                    val crResults = crObj.optJSONArray("results")
-                    if (crResults != null) {
-                        var inRating: String? = null
-                        var usRating: String? = null
-                        var gbRating: String? = null
-                        var anyRating: String? = null
-                        for (i in 0 until crResults.length()) {
-                            val r = crResults.optJSONObject(i) ?: continue
-                            val country = r.optString("iso_3166_1")
-                            val rating = r.optString("rating").trim()
-                            if (rating.isBlank()) continue
-                            if (country == "IN") inRating = rating
-                            if (country == "US") usRating = rating
-                            if (country == "GB") gbRating = rating
-                            if (anyRating == null) anyRating = rating
-                        }
-                        ratingBadge = inRating ?: usRating ?: gbRating ?: anyRating
-                    }
-                }
-                val kwJson = httpGet("https://api.tmdb.org/3/tv/$id/keywords?api_key=$TMDB_API_KEY")
-                if (kwJson != null) {
-                    val kwObj = JSONObject(kwJson)
-                    val kwArr = kwObj.optJSONArray("results")
-                    if (kwArr != null) {
-                        for (i in 0 until kwArr.length()) {
-                            val kw = kwArr.optJSONObject(i)?.optString("name")?.lowercase() ?: continue
-                            keywordsList.add(kw)
+                if (mediaType == "tv") {
+                    val crJson = httpGet("https://api.tmdb.org/3/tv/$id/content_ratings?api_key=$TMDB_API_KEY")
+                    if (crJson != null) {
+                        val crObj = JSONObject(crJson)
+                        val crResults = crObj.optJSONArray("results")
+                        if (crResults != null) {
+                            var inRating: String? = null
+                            var usRating: String? = null
+                            var gbRating: String? = null
+                            var anyRating: String? = null
+                            for (i in 0 until crResults.length()) {
+                                val r = crResults.optJSONObject(i) ?: continue
+                                val country = r.optString("iso_3166_1")
+                                val rating = r.optString("rating").trim()
+                                if (rating.isBlank()) continue
+                                if (country == "IN") inRating = rating
+                                if (country == "US") usRating = rating
+                                if (country == "GB") gbRating = rating
+                                if (anyRating == null) anyRating = rating
+                            }
+                            ratingBadge = inRating ?: usRating ?: gbRating ?: anyRating
                         }
                     }
-                }
-            } else {
-                val relJson = httpGet("https://api.tmdb.org/3/movie/$id/release_dates?api_key=$TMDB_API_KEY")
-                if (relJson != null) {
-                    val relObj = JSONObject(relJson)
-                    val relResults = relObj.optJSONArray("results")
-                    if (relResults != null) {
-                        var inCert: String? = null
-                        var usCert: String? = null
-                        var gbCert: String? = null
-                        var anyCert: String? = null
-                        for (i in 0 until relResults.length()) {
-                            val r = relResults.optJSONObject(i) ?: continue
-                            val country = r.optString("iso_3166_1")
-                            val dates = r.optJSONArray("release_dates") ?: continue
-                            for (j in 0 until dates.length()) {
-                                val d = dates.optJSONObject(j) ?: continue
-                                val cert = d.optString("certification").trim()
-                                if (cert.isBlank()) continue
-                                if (country == "IN" && inCert == null) inCert = cert
-                                if (country == "US" && usCert == null) usCert = cert
-                                if (country == "GB" && gbCert == null) gbCert = cert
-                                if (anyCert == null) anyCert = cert
+
+                    val kwJson = httpGet("https://api.tmdb.org/3/tv/$id/keywords?api_key=$TMDB_API_KEY")
+                    if (kwJson != null) {
+                        val kwObj = JSONObject(kwJson)
+                        val kwArr = kwObj.optJSONArray("results")
+                        if (kwArr != null) {
+                            for (i in 0 until kwArr.length()) {
+                                val kw = kwArr.optJSONObject(i)?.optString("name")?.lowercase() ?: continue
+                                keywordsList.add(kw)
                             }
                         }
-                        ratingBadge = inCert ?: usCert ?: gbCert ?: anyCert
                     }
-                }
-                val kwJson = httpGet("https://api.tmdb.org/3/movie/$id/keywords?api_key=$TMDB_API_KEY")
-                if (kwJson != null) {
-                    val kwObj = JSONObject(kwJson)
-                    val kwArr = kwObj.optJSONArray("keywords")
-                    if (kwArr != null) {
-                        for (i in 0 until kwArr.length()) {
-                            val kw = kwArr.optJSONObject(i)?.optString("name")?.lowercase() ?: continue
-                            keywordsList.add(kw)
+                } else {
+                    val relJson = httpGet("https://api.tmdb.org/3/movie/$id/release_dates?api_key=$TMDB_API_KEY")
+                    if (relJson != null) {
+                        val relObj = JSONObject(relJson)
+                        val relResults = relObj.optJSONArray("results")
+                        if (relResults != null) {
+                            var inCert: String? = null
+                            var usCert: String? = null
+                            var gbCert: String? = null
+                            var anyCert: String? = null
+                            for (i in 0 until relResults.length()) {
+                                val r = relResults.optJSONObject(i) ?: continue
+                                val country = r.optString("iso_3166_1")
+                                val dates = r.optJSONArray("release_dates") ?: continue
+                                for (j in 0 until dates.length()) {
+                                    val d = dates.optJSONObject(j) ?: continue
+                                    val cert = d.optString("certification").trim()
+                                    if (cert.isBlank()) continue
+                                    if (country == "IN" && inCert == null) inCert = cert
+                                    if (country == "US" && usCert == null) usCert = cert
+                                    if (country == "GB" && gbCert == null) gbCert = cert
+                                    if (anyCert == null) anyCert = cert
+                                }
+                            }
+                            ratingBadge = inCert ?: usCert ?: gbCert ?: anyCert
+                        }
+                    }
+
+                    val kwJson = httpGet("https://api.tmdb.org/3/movie/$id/keywords?api_key=$TMDB_API_KEY")
+                    if (kwJson != null) {
+                        val kwObj = JSONObject(kwJson)
+                        val kwArr = kwObj.optJSONArray("keywords")
+                        if (kwArr != null) {
+                            for (i in 0 until kwArr.length()) {
+                                val kw = kwArr.optJSONObject(i)?.optString("name")?.lowercase() ?: continue
+                                keywordsList.add(kw)
+                            }
                         }
                     }
                 }
-            }
 
-            for (k in keywordsList) {
-                if (k.contains("smoking") || k.contains("tobacco") || k.contains("cigarette") || k.contains("cigar")) {
-                    hasTobacco = true
+                for (k in keywordsList) {
+                    if (k.contains("smoking") || k.contains("tobacco") || k.contains("cigarette") || k.contains("cigar")) {
+                        hasTobacco = true
+                    }
                 }
-            }
 
-            if (ratingBadge.isNullOrBlank()) return null
-            val descriptors = mapKeywordsToDescriptors(keywordsList, ratingBadge)
-            return MetadataResult(ratingBadge, descriptors, hasTobacco)
+                if (ratingBadge.isNullOrBlank()) return null
+                val descriptors = mapKeywordsToDescriptors(keywordsList, ratingBadge)
+                MetadataResult(ratingBadge, descriptors, hasTobacco)
+            } catch (t: Throwable) {
+                null
+            }
         }
 
         private fun queryOmdb(title: String, year: Int?): MetadataResult? {
             val encoded = URLEncoder.encode(title, "UTF-8")
-            val url = "http://www.omdbapi.com/?t=$encoded${if (year != null) "&y=$year" else ""}&apikey=$OMDB_API_KEY"
-            val jsonStr = httpGet(url) ?: return null
-            val obj = JSONObject(jsonStr)
-            if (obj.optString("Response") != "True") return null
-            val rated = obj.optString("Rated").trim()
-            if (rated.isBlank() || rated == "N/A" || rated.equals("Not Rated", ignoreCase = true)) return null
+            for (key in OMDB_API_KEYS) {
+                try {
+                    val url = "https://www.omdbapi.com/?t=$encoded${if (year != null) "&y=$year" else ""}&apikey=$key"
+                    val jsonStr = httpGet(url) ?: continue
+                    val obj = JSONObject(jsonStr)
+                    if (obj.optString("Response") != "True") continue
+                    val rated = obj.optString("Rated").trim()
+                    if (rated.isBlank() || rated == "N/A" || rated.equals("Not Rated", ignoreCase = true)) continue
 
-            val genre = obj.optString("Genre", "")
-            val plot = obj.optString("Plot", "").lowercase()
-            val hasTobacco = plot.contains("smoking") || plot.contains("tobacco") ||
-                plot.contains("cigarette") || plot.contains("cigar")
+                    val genre = obj.optString("Genre", "")
+                    val plot = obj.optString("Plot", "").lowercase()
+                    val hasTobacco = plot.contains("smoking") || plot.contains("tobacco") ||
+                        plot.contains("cigarette") || plot.contains("cigar")
 
-            val descriptors = mapGenreToDescriptors(genre, rated)
-            return MetadataResult(rated, descriptors, hasTobacco)
+                    val descriptors = mapGenreToDescriptors(genre, rated)
+                    return MetadataResult(rated, descriptors, hasTobacco)
+                } catch (t: Throwable) { }
+            }
+            return null
         }
 
         private fun mapKeywordsToDescriptors(keywords: List<String>, rating: String): String {
@@ -1792,7 +1947,7 @@ class MovyAdvisoryOverlay private constructor(
                 val conn = url.openConnection() as HttpURLConnection
                 conn.connectTimeout = 4000
                 conn.readTimeout = 4000
-                conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
                 if (conn.responseCode in 200..299) {
                     BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
                 } else null
@@ -1836,18 +1991,10 @@ class MovyAdvisoryOverlay private constructor(
         private val TEXT_FADE_OUT_MS = (TEXT_RETRACT_MS * 0.20f).toLong()
         private val BAR_FADE_OUT_MS = (BAR_OUT_MS * 0.25f).toLong()
 
-        private val IN_COMPLETE_MS = DESCRIPTORS_IN_DELAY_MS + TEXT_SLIDE_MS
-        private val EXIT_START_MS = IN_COMPLETE_MS + HOLD_MS
-        private val EXIT_TOTAL_MS = VIGNETTE_OUT_DELAY_MS + VIGNETTE_FADE_MS
-
+        // Exactly 3.0 seconds hold after in-animation finishes
         private const val HOLD_MS = 3_000L
         private const val START_DELAY_MS = 1_500L
         private const val TOBACCO_GAP_AFTER_MAIN_MS = 600L
-
-        private val TOBACCO_HOLD_MS = 3_500L
-        private val TOBACCO_IN_COMPLETE_MS = RATING_IN_DELAY_MS + TEXT_SLIDE_MS
-        private val TOBACCO_EXIT_START_MS = TOBACCO_IN_COMPLETE_MS + TOBACCO_HOLD_MS
-        private val TOBACCO_EXIT_TOTAL_MS = VIGNETTE_OUT_DELAY_MS + VIGNETTE_FADE_MS
 
         // Placement (restored to original values per user request):
         private const val START_INSET_DP = 48
@@ -1856,8 +2003,9 @@ class MovyAdvisoryOverlay private constructor(
         private const val TOP_INSET_COMPACT_DP = 24
         private const val COMPACT_WIDTH_DP = 768f
 
-        // Slender Ribbon UI styling:
+        // Slender Ribbon UI styling & uniform middle height:
         private const val RIBBON_WIDTH_DP = 2.8f
+        private const val UNIFORM_BAR_HEIGHT_DP = 42
         private const val MASK_GAP_DP = 8
         private const val MASK_TRAILING_DP = 4
         private const val ROW_GAP_DP = 3
@@ -1888,8 +2036,6 @@ class MovyAdvisoryOverlay private constructor(
         private const val POSITION_STALE_MS = 2_000L
 
         private const val DEMO_PREFIX = "RATED"
-        private const val DEMO_RATING = "A"
-        private const val DEMO_TEXT = "self-harm, sex, violence, substances, suicide, tobacco use"
 
         private val DEFAULT_RIBBON_COLOR = Color.parseColor("#E50914")
         private val REASON_COLOR = Color.parseColor("#E2E2E2")
@@ -1945,7 +2091,7 @@ class MovyAdvisoryOverlay private constructor(
                 instance.also { instance = null }
             } ?: return
             current.detach()
-            current.app.unregisterActivityLifecycleCallbacks(current)
+            current.appInstance.unregisterActivityLifecycleCallbacks(current)
         }
     }
 }

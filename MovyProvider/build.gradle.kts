@@ -1,4 +1,4 @@
-version = 7
+version = 8
 
 cloudstream {
     description = "Movies and TV series from movy.sx, NetMirror, and Bingr"

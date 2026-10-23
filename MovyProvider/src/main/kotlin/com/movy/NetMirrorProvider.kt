@@ -66,33 +66,11 @@ class NetMirrorProvider : MainAPI() {
     @Volatile
     private var lastVerifyAt: Long = 0L
 
-    @Volatile
-    private var newTvBase: String? = null
-
-    private val newTvHeaders = mapOf(
-        "Cache-Control" to "no-cache, no-store, must-revalidate",
-        "Pragma" to "no-cache",
-        "Expires" to "0",
-        "X-Requested-With" to "NetmirrorNewTV v1.0",
-        "User-Agent" to NEWTV_USER_AGENT,
-        "Accept" to "application/json, text/plain, */*",
-        "Ott" to "nf"
-    )
-
     private fun currentCookies(): MutableMap<String, String> {
         val cookies = NetMirrorStore.cookies()
         cookies["ott"] = "nf"
         cookies["hd"] = "on"
         return cookies
-    }
-
-    private fun newTvRequestHeaders(): Map<String, String> {
-        val cookies = currentCookies()
-        val result = newTvHeaders.toMutableMap()
-        val cookie = cookieHeader(cookies)
-        if (cookie.isNotBlank()) result["Cookie"] = cookie
-        result["Usertoken"] = cookies["user_token"].orEmpty()
-        return result
     }
 
     private fun streamRequestHeaders(
@@ -545,283 +523,6 @@ class NetMirrorProvider : MainAPI() {
         return result
     }
 
-    private suspend fun resolveNewTvBase(force: Boolean = false): String? {
-        val cached = newTvBase
-        if (!force && !cached.isNullOrBlank()) return cached
-        if (force) newTvBase = null
-
-        for (domain in NEWTV_DOMAINS) {
-            val response = runCatching {
-                app.get("$domain/checknewtv.php", headers = newTvHeaders)
-            }.getOrNull() ?: continue
-            if (response.code !in 200..299) continue
-            val token = runCatching {
-                JSONObject(response.text).optString("token_hash")
-            }.getOrNull()
-            if (token.isNullOrBlank()) continue
-            val decoded = runCatching {
-                String(Base64.decode(token, Base64.DEFAULT), Charsets.UTF_8)
-                    .trim()
-                    .trimEnd('/')
-            }.getOrNull()
-            if (decoded.isNullOrBlank() || !decoded.startsWith("http")) continue
-            newTvBase = decoded
-            return decoded
-        }
-        return null
-    }
-
-    private suspend fun filterBrokenVariants(
-        masterUrl: String,
-        manifest: String,
-        referer: String
-    ): String? {
-        val lines = manifest.lines()
-        val output = mutableListOf<String>()
-        var removed = false
-        var validVariants = 0
-        var index = 0
-        while (index < lines.size) {
-            val line = lines[index].trim()
-            if (!line.startsWith("#EXT-X-STREAM-INF", ignoreCase = true)) {
-                if (line.isNotEmpty()) output.add(line)
-                index++
-                continue
-            }
-
-            val uriIndex = (index + 1 until lines.size).firstOrNull {
-                val candidate = lines[it].trim()
-                candidate.isNotEmpty() && !candidate.startsWith("#")
-            }
-            if (uriIndex == null) {
-                removed = true
-                index++
-                continue
-            }
-
-            val uri = absoluteUrl(masterUrl, lines[uriIndex].trim())
-            val candidateManifest = runCatching {
-                app.get(
-                    uri,
-                    headers = newTvRequestHeaders() + mapOf("Accept" to "*/*"),
-                    referer = referer
-                ).text
-            }.getOrNull().orEmpty()
-            if (candidateManifest.contains("#EXTM3U")) {
-                output.add(line)
-                output.add(uri)
-                validVariants++
-            } else {
-                removed = true
-                Log.d(TAG, "Dropping invalid NetMirror variant $uri")
-            }
-            index = uriIndex + 1
-        }
-
-        if (!removed) return null
-        if (validVariants == 0) return ""
-        return output.joinToString("\n")
-    }
-
-    private fun normalizeNewTvLink(link: String): String {
-        val marker = "/newtv/hls/nf/"
-        val index = link.indexOf(marker)
-        if (index < 0) return link
-        val tail = link.substring(index + marker.length)
-        if (!tail.startsWith("http://") && !tail.startsWith("https://")) return link
-        val file = tail.substringAfterLast('/').substringBefore('?')
-        if (!file.endsWith(".m3u8", ignoreCase = true)) return link
-        return link.substring(0, index + marker.length) + file
-    }
-
-    private fun absoluteUrl(base: String, ref: String): String {
-        if (ref.startsWith("http://") || ref.startsWith("https://")) return ref
-        if (ref.startsWith("//")) return "https:$ref"
-        val clean = base.substringBefore('#').substringBefore('?')
-        if (ref.startsWith('/')) {
-            val scheme = clean.substringBefore("://")
-            val host = clean.substringAfter("://").substringBefore('/')
-            return "$scheme://$host$ref"
-        }
-        return clean.substringBeforeLast('/') + "/" + ref
-    }
-
-    private fun manifestAttribute(line: String, key: String): String? {
-        val quoted = Regex(
-            """(?:^|,)\s*${Regex.escape(key)}="([^"]*)"""",
-            RegexOption.IGNORE_CASE
-        ).find(line)
-        if (quoted != null) return quoted.groupValues[1]
-        return Regex(
-            """(?:^|,)\s*${Regex.escape(key)}=([^,]+)""",
-            RegexOption.IGNORE_CASE
-        ).find(line)?.groupValues?.getOrNull(1)?.trim()?.trim('"')
-    }
-
-    private fun manifestQuality(manifest: String): Int {
-        val height = Regex("""RESOLUTION=\d+x(\d+)""", RegexOption.IGNORE_CASE)
-            .findAll(manifest)
-            .mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }
-            .maxOrNull() ?: return Qualities.Unknown.value
-        return when {
-            height >= 2160 -> Qualities.P2160.value
-            height >= 1080 -> Qualities.P1080.value
-            height >= 720 -> Qualities.P720.value
-            height >= 480 -> Qualities.P480.value
-            height >= 360 -> Qualities.P360.value
-            else -> Qualities.Unknown.value
-        }
-    }
-
-    private suspend fun resolveSubtitleUrl(url: String, referer: String): String? {
-        val encoded = url.replace("[", "%5B").replace("]", "%5D")
-        val path = encoded.substringBefore('?').lowercase()
-        if (path.endsWith(".vtt") || path.endsWith(".srt") || path.endsWith(".ass")) {
-            return encoded
-        }
-        val text = runCatching {
-            app.get(
-                encoded,
-                headers = streamRequestHeaders(currentCookies(), referer),
-                referer = referer
-            ).text
-        }.getOrNull() ?: return null
-        if (text.trimStart().startsWith("WEBVTT")) return encoded
-        if (text.contains("<html", ignoreCase = true)) return null
-        val child = text.lineSequence()
-            .map { it.trim() }
-            .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
-            ?: return null
-        val resolved = absoluteUrl(encoded, child)
-        if (resolved.substringBefore('?').lowercase().endsWith(".m3u8")) return null
-        return resolved.replace("[", "%5B").replace("]", "%5D")
-    }
-
-    private suspend fun registerNewTvSubtitles(
-        masterUrl: String,
-        manifest: String,
-        referer: String,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ) {
-        val seen = mutableSetOf<String>()
-        manifest.lineSequence().forEach { line ->
-            if (!line.startsWith("#EXT-X-MEDIA:", ignoreCase = true) ||
-                !line.contains("TYPE=SUBTITLES", ignoreCase = true)
-            ) return@forEach
-            val uri = manifestAttribute(line, "URI") ?: return@forEach
-            val label = manifestAttribute(line, "NAME")
-                ?: manifestAttribute(line, "LANGUAGE")
-                ?: "Subtitle"
-            val subUrl = resolveSubtitleUrl(absoluteUrl(masterUrl, uri), referer)
-                ?: return@forEach
-            if (!seen.add(subUrl)) return@forEach
-            subtitleCallback.invoke(
-                newSubtitleFile(label, subUrl) {
-                    this.headers = streamRequestHeaders(currentCookies(), referer)
-                }
-            )
-        }
-    }
-
-    private suspend fun loadLinksNewTv(
-        loadData: LoadData,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        var player: JSONObject? = null
-        val tvHeaders = newTvRequestHeaders()
-        for (attempt in 0..1) {
-            val base = if (attempt == 0) {
-                resolveNewTvBase()
-            } else {
-                resolveNewTvBase(force = true)
-            } ?: continue
-            player = runCatching {
-                val response = app.get(
-                    "$base/newtv/player.php?id=${loadData.id}",
-                    headers = tvHeaders
-                )
-                JSONObject(response.text)
-            }.getOrNull()
-            if (player?.optString("status") == "ok" &&
-                player?.optString("video_link")?.isNotBlank() == true
-            ) break
-        }
-
-        val playerJson = player ?: return false
-        val status = playerJson.optString("status")
-        val userToken = playerJson.optString("usertoken")
-        if (status != "ok") {
-            Log.d(
-                TAG,
-                "NewTV stream requires verification status=$status " +
-                    "usertoken=$userToken; rejecting"
-            )
-            return false
-        }
-        val rawLink = playerJson.optString("video_link").takeIf { it.isNotBlank() } ?: return false
-        val link = normalizeNewTvLink(rawLink)
-        Log.d(TAG, "NewTV link raw=$rawLink normalized=$link")
-        val referer = playerJson.optString("referer").ifBlank { mainUrl }
-        val masterResponse = runCatching {
-            app.get(
-                link,
-                headers = tvHeaders + mapOf("Accept" to "*/*"),
-                referer = referer
-            )
-        }.getOrNull()
-        var master = masterResponse?.text.orEmpty()
-        var isManifest = master.contains("#EXTM3U")
-        if (!isManifest) {
-            Log.d(
-                TAG,
-                "NewTV master invalid code=${masterResponse?.code} " +
-                    "type=${masterResponse?.headers?.get("Content-Type")} " +
-                    "head=${master.take(240).replace("\n", " ")}"
-            )
-            val plain = runCatching {
-                app.get(link, headers = tvHeaders + mapOf("Accept" to "*/*"))
-            }.getOrNull()?.text.orEmpty()
-            if (plain.contains("#EXTM3U")) {
-                master = plain
-                isManifest = true
-                Log.d(TAG, "NewTV master recovered without custom headers")
-            }
-        }
-        if (!isManifest) {
-            Log.d(TAG, "NewTV manifest unavailable; skipping Auto source")
-            return false
-        }
-        if (master.contains("/220884/")) {
-            Log.w(TAG, "NetMirror served abuse punishment video 220884; rejecting NewTV stream")
-            return false
-        }
-
-        val filtered = filterBrokenVariants(link, master, referer)
-        if (filtered != null) {
-            Log.d(TAG, "NewTV master has invalid variants; skipping Auto source")
-            return false
-        }
-
-        lastCookies = currentCookies()
-        val streamHeaders = streamRequestHeaders(lastCookies, referer)
-
-        callback.invoke(
-            newExtractorLink(
-                source = name,
-                name = "$name Auto",
-                url = link,
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.referer = referer
-                this.quality = manifestQuality(master)
-                this.headers = streamHeaders
-            }
-        )
-        registerNewTvSubtitles(link, master, referer, subtitleCallback)
-        return true
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -829,9 +530,7 @@ class NetMirrorProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val loadData = parseData(data) ?: return false
-        if (loadLinksNewTv(loadData, subtitleCallback, callback)) return true
-
-        val cookies = session()
+        var cookies = session()
         lastCookies = cookies
 
         if (cookies["user_token"].isNullOrBlank()) {
@@ -843,13 +542,138 @@ class NetMirrorProvider : MainAPI() {
             )
         }
 
-        return loadLinksPlaylist(
-            loadData,
-            cookies,
-            subtitleCallback,
-            callback,
-            allowLoginPrompt = true
+        val playlistParams = mapOf(
+            "id" to loadData.id,
+            "t" to loadData.title,
+            "tm" to now()
         )
+        val playlistHeaders = headers + mapOf(
+            "Cookie" to cookieHeader(cookies),
+            "Usertoken" to cookies["user_token"].orEmpty(),
+            "Referer" to "$mainUrl/mobile/home?app=1"
+        )
+        var playlistResponse = runCatching {
+            app.get(
+                "$mainUrl/mobile/playlist.php",
+                params = playlistParams,
+                headers = playlistHeaders,
+                cookies = cookies,
+                referer = "$mainUrl/mobile/home?app=1"
+            )
+        }.getOrNull() ?: return false
+
+        var playlist = playlistResponse.text
+        if (playlistResponse.code == 403 || playlist.contains("/verify2")) {
+            cookies = session(force = true)
+            lastCookies = cookies
+            playlistResponse = runCatching {
+                app.get(
+                    "$mainUrl/mobile/playlist.php",
+                    params = playlistParams,
+                    headers = headers + mapOf(
+                        "Cookie" to cookieHeader(cookies),
+                        "Usertoken" to cookies["user_token"].orEmpty(),
+                        "Referer" to "$mainUrl/mobile/home?app=1"
+                    ),
+                    cookies = cookies,
+                    referer = "$mainUrl/mobile/home?app=1"
+                )
+            }.getOrNull() ?: return false
+            playlist = playlistResponse.text
+        }
+
+        Log.d(
+            TAG,
+            "NetMirror playlist response code=${playlistResponse.code} len=${playlist.length} " +
+                "preview=${playlist.take(120).replace("\n", " ")}"
+        )
+
+        if (playlist.isBlank() ||
+            playlist.contains("/verify2") ||
+            playlist.contains("Just a moment")
+        ) {
+            NetMirrorSettings.showLogin(
+                "Your NetMirror session expired. Log in again to unlock playback."
+            )
+            throw ErrorLoadingException("NetMirror session expired. Complete the login popup, then retry.")
+        }
+
+        var array = runCatching { JSONArray(playlist) }.getOrNull()
+        if (array == null || array.length() == 0) {
+            Log.d(TAG, "Playlist empty, retrying with forced session refresh")
+            cookies = session(force = true)
+            lastCookies = cookies
+            playlist = runCatching {
+                app.get(
+                    "$mainUrl/mobile/playlist.php",
+                    params = playlistParams,
+                    headers = headers + mapOf(
+                        "Cookie" to cookieHeader(cookies),
+                        "Usertoken" to cookies["user_token"].orEmpty(),
+                        "Referer" to "$mainUrl/mobile/home?app=1"
+                    ),
+                    cookies = cookies,
+                    referer = "$mainUrl/mobile/home?app=1"
+                ).text
+            }.getOrNull().orEmpty()
+            array = runCatching { JSONArray(playlist) }.getOrNull()
+        }
+
+        if (array == null || array.length() == 0) {
+            NetMirrorSettings.showLogin(
+                "Your NetMirror session expired. Log in again to unlock playback."
+            )
+            throw ErrorLoadingException("NetMirror session expired. Complete the login popup, then retry.")
+        }
+
+        val item = array.optJSONObject(0) ?: return false
+        val sources = item.optJSONArray("sources") ?: return false
+
+        var found = false
+        val streamHeaders = streamRequestHeaders(cookies, "$mainUrl/")
+        for (i in 0 until sources.length()) {
+            val source = sources.optJSONObject(i) ?: continue
+            val file = source.optString("file").takeIf { it.isNotBlank() } ?: continue
+            val label = source.optString("label").ifBlank { "NetMirror" }
+            val url = if (file.startsWith("http")) file else "$mainUrl$file"
+
+            callback.invoke(
+                newExtractorLink(
+                    source = name,
+                    name = if (label == "Auto") name else "$name $label",
+                    url = url,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "$mainUrl/"
+                    this.quality = qualityOf(label)
+                    this.headers = streamHeaders
+                }
+            )
+            found = true
+        }
+
+        val tracks = item.optJSONArray("tracks")
+        if (tracks != null) {
+            for (i in 0 until tracks.length()) {
+                val track = tracks.optJSONObject(i) ?: continue
+                val kind = track.optString("kind").lowercase()
+                if (kind != "captions" && kind != "subtitles") continue
+                val file = track.optString("file").takeIf { it.isNotBlank() } ?: continue
+                val subUrl = when {
+                    file.startsWith("//") -> "https:$file"
+                    file.startsWith("http") -> file
+                    file.startsWith("/") -> "https://subscdn.top$file"
+                    else -> "https://subscdn.top/$file"
+                }
+                val label = track.optString("label").ifBlank { "Subtitle" }
+                subtitleCallback.invoke(
+                    newSubtitleFile(label, subUrl) {
+                        this.headers = streamHeaders
+                    }
+                )
+            }
+        }
+        return found
     }
 
     suspend fun loadLinksForTitle(
@@ -876,275 +700,10 @@ class NetMirrorProvider : MainAPI() {
         }
 
         Log.d(TAG, "Hybrid lookup matched \"$title\" -> $id")
-        val cookies = session()
-        lastCookies = cookies
-        Log.d(TAG, "Hybrid trying legacy playlist for \"$title\"")
-        if (loadLinksPlaylist(
-                loadData,
-                cookies,
-                subtitleCallback,
-                callback,
-                allowLoginPrompt = false
-            )
-        ) return true
-
-        Log.d(TAG, "Hybrid legacy playlist unavailable; trying NewTV for \"$title\"")
-        return loadLinksNewTv(loadData, subtitleCallback, callback)
+        return loadLinks(encodeData(loadData.id, loadData.title), false, subtitleCallback, callback)
     }
 
-    private fun isRateLimited(text: String): Boolean =
-        text.contains("too many requests", ignoreCase = true)
 
-    private suspend fun nativePlaylist(
-        loadData: LoadData,
-        cookies: Map<String, String>
-    ): Pair<String, Int>? {
-        val playHeaders = headers + mapOf(
-            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin" to NATIVE_ORIGIN,
-            "Referer" to NATIVE_REFERER,
-            "Cookie" to cookieHeader(cookies),
-            "Usertoken" to cookies["user_token"].orEmpty()
-        )
-        val playResponse = runCatching {
-            app.post(
-                NATIVE_PLAY_URL,
-                data = mapOf("id" to loadData.id),
-                headers = playHeaders,
-                cookies = cookies,
-                referer = NATIVE_REFERER
-            )
-        }.getOrNull() ?: return null
-        val token = runCatching { JSONObject(playResponse.text).optString("h") }
-            .getOrNull()
-            ?.takeIf { it.isNotBlank() } ?: return null
-
-        val playlistResponse = runCatching {
-            app.get(
-                NATIVE_PLAYLIST_URL,
-                params = mapOf(
-                    "id" to loadData.id,
-                    "t" to loadData.title,
-                    "tm" to now(),
-                    "h" to token
-                ),
-                headers = headers + mapOf(
-                    "Origin" to NATIVE_ORIGIN,
-                    "Referer" to NATIVE_REFERER,
-                    "Cookie" to cookieHeader(cookies),
-                    "Usertoken" to cookies["user_token"].orEmpty()
-                ),
-                cookies = cookies,
-                referer = NATIVE_REFERER
-            )
-        }.getOrNull() ?: return null
-
-        Log.d(
-            TAG,
-            "Native playlist id=${loadData.id} play=${playResponse.code} " +
-                "code=${playlistResponse.code} len=${playlistResponse.text.length} " +
-                "hLen=${token.length}"
-        )
-        return playlistResponse.text to playlistResponse.code
-    }
-
-    private suspend fun loadLinksPlaylist(
-        loadData: LoadData,
-        initialCookies: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        allowLoginPrompt: Boolean
-    ): Boolean {
-        var cookies = initialCookies
-        val playlistParams = mapOf(
-            "id" to loadData.id,
-            "t" to loadData.title,
-            "tm" to now()
-        )
-        var playlist = ""
-        var playlistCode = 0
-        var playlistSource = "native"
-
-        val native = nativePlaylist(loadData, cookies)
-        if (native != null && native.first.isNotBlank() && !isRateLimited(native.first)) {
-            playlist = native.first
-            playlistCode = native.second
-        } else {
-            if (native != null && isRateLimited(native.first)) {
-                Log.d(TAG, "Native playlist rate-limited; falling back to mobile flow")
-            }
-            playlistSource = "mobile"
-            var mobileResponse = runCatching {
-                app.get(
-                    "$mainUrl/mobile/playlist.php",
-                    params = playlistParams,
-                    headers = headers + mapOf(
-                            "Cookie" to cookieHeader(cookies),
-                            "Usertoken" to cookies["user_token"].orEmpty()
-                        ),
-                    referer = "$mainUrl/mobile/home?app=1"
-                )
-            }.getOrNull() ?: return false
-            if (mobileResponse.code == 403 || mobileResponse.text.contains("/verify2")) {
-                cookies = session(force = true)
-                lastCookies = cookies
-                mobileResponse = runCatching {
-                    app.get(
-                        "$mainUrl/mobile/playlist.php",
-                        params = playlistParams,
-                        headers = headers + mapOf(
-                            "Cookie" to cookieHeader(cookies),
-                            "Usertoken" to cookies["user_token"].orEmpty()
-                        ),
-                        referer = "$mainUrl/mobile/home?app=1"
-                    )
-                }.getOrNull() ?: return false
-            }
-            playlist = mobileResponse.text
-            playlistCode = mobileResponse.code
-        }
-        Log.d(
-            TAG,
-            "Legacy playlist source=$playlistSource id=${loadData.id} t=${loadData.title} " +
-                "code=$playlistCode length=${playlist.length} " +
-                "cookieLen=${cookieHeader(cookies).length} " +
-                "hasToken=${!cookies["user_token"].isNullOrBlank()} " +
-                "head=${playlist.take(120).replace("\n", " ")}"
-        )
-        if (isRateLimited(playlist)) {
-            Log.d(TAG, "NetMirror rate limit reached; leaving fallback sources available")
-            return false
-        }
-        if (playlist.isBlank() ||
-            playlist.contains("/verify2") ||
-            playlist.contains("Just a moment")
-        ) {
-            if (!allowLoginPrompt) return false
-            NetMirrorSettings.showLogin(
-                "Your NetMirror session expired. Log in again to unlock playback."
-            )
-            throw ErrorLoadingException("NetMirror session expired. Complete the login popup, then retry.")
-        }
-
-        var array = runCatching { JSONArray(playlist) }.getOrNull()
-        if (array == null || array.length() == 0) {
-            Log.d(TAG, "Legacy playlist empty; forcing a fresh NetMirror session")
-            cookies = session(force = true)
-            lastCookies = cookies
-            playlist = runCatching {
-                app.get(
-                    "$mainUrl/mobile/playlist.php",
-                    params = playlistParams,
-                    headers = headers + mapOf(
-                            "Cookie" to cookieHeader(cookies),
-                            "Usertoken" to cookies["user_token"].orEmpty()
-                        ),
-                    referer = "$mainUrl/mobile/home?app=1"
-                ).text
-            }.getOrNull().orEmpty()
-            Log.d(
-                TAG,
-                "Legacy playlist retry length=${playlist.length} " +
-                    "cookieLen=${cookieHeader(cookies).length} " +
-                    "hasToken=${!cookies["user_token"].isNullOrBlank()} " +
-                    "head=${playlist.take(120).replace("\n", " ")}"
-            )
-            array = runCatching { JSONArray(playlist) }.getOrNull()
-        }
-        if (array == null || array.length() == 0) {
-            if (!allowLoginPrompt) return false
-            NetMirrorSettings.showLogin(
-                "Your NetMirror session expired. Log in again to unlock playback."
-            )
-            throw ErrorLoadingException("NetMirror session expired. Complete the login popup, then retry.")
-        }
-        val item = array.optJSONObject(0) ?: return false
-        val sources = item.optJSONArray("sources") ?: return false
-
-        val validSources = mutableListOf<Pair<JSONObject, String>>()
-        val probeCache = mutableMapOf<String, String>()
-        var punishment = false
-        for (i in 0 until sources.length()) {
-            val source = sources.optJSONObject(i) ?: continue
-            val file = source.optString("file").takeIf { it.isNotBlank() } ?: continue
-            val url = if (file.startsWith("http")) file else "$mainUrl$file"
-            val probeManifest = probeCache.getOrPut(url) {
-                runCatching {
-                    app.get(
-                        url,
-                        headers = streamRequestHeaders(cookies, "$mainUrl/"),
-                        referer = "$mainUrl/"
-                    ).text
-                }.getOrNull().orEmpty()
-            }
-            if (probeManifest.contains("/220884/") ||
-                probeManifest.contains("Only Valid Users Allowed", ignoreCase = true)
-            ) {
-                Log.w(TAG, "NetMirror served abuse punishment video 220884; skipping $url")
-                punishment = true
-                continue
-            }
-            if (probeManifest.isNotBlank() && !probeManifest.contains("#EXTM3U")) {
-                Log.w(TAG, "NetMirror source is not an HLS manifest; skipping $url")
-                continue
-            }
-            validSources.add(source to url)
-        }
-        if (validSources.isEmpty()) {
-            if (punishment) {
-                Log.w(TAG, "NetMirror served only abuse punishment video 220884; rejecting legacy stream")
-                if (allowLoginPrompt) {
-                    NetMirrorSettings.showLogin(
-                        "NetMirror needs a verified login/ad session. Complete the ad or paste user_token, then retry."
-                    )
-                }
-            }
-            return false
-        }
-
-        var found = false
-        for ((source, url) in validSources) {
-            val label = source.optString("label").ifBlank { "NetMirror" }
-
-            callback.invoke(
-                newExtractorLink(
-                    source = name,
-                    name = if (label == "Auto") name else "$name $label",
-                    url = url,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = "$mainUrl/"
-                    this.quality = qualityOf(label)
-                    this.headers = streamRequestHeaders(cookies, "$mainUrl/")
-                }
-            )
-            found = true
-        }
-
-        val tracks = item.optJSONArray("tracks")
-        if (tracks != null) {
-            for (i in 0 until tracks.length()) {
-                val track = tracks.optJSONObject(i) ?: continue
-                val kind = track.optString("kind").lowercase()
-                if (kind != "captions" && kind != "subtitles") continue
-                val file = track.optString("file").takeIf { it.isNotBlank() } ?: continue
-                val subUrl = when {
-                    file.startsWith("//") -> "https:$file"
-                    file.startsWith("http") -> file
-                    file.startsWith("/") -> "https://subscdn.top$file"
-                    else -> "https://subscdn.top/$file"
-                }
-                val label = track.optString("label").ifBlank { "Subtitle" }
-                subtitleCallback.invoke(
-                    newSubtitleFile(label, subUrl) {
-                        this.headers = streamRequestHeaders(cookies, "$mainUrl/")
-                    }
-                )
-            }
-        }
-
-        return found
-    }
 
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor? {
         return Interceptor { chain ->
@@ -1193,10 +752,6 @@ class NetMirrorProvider : MainAPI() {
 
     companion object {
         private const val TAG = "NetMirrorProvider"
-        private const val NATIVE_ORIGIN = "https://net77.cc"
-        private const val NATIVE_REFERER = "https://net77.cc/home"
-        private const val NATIVE_PLAY_URL = "https://net77.cc/play.php"
-        private const val NATIVE_PLAYLIST_URL = "https://net52.cc/playlist.php"
         private const val SESSION_TTL_MS = 15L * 60L * 60L * 1000L
         private const val VERIFY_COOLDOWN_MS = 60L * 1000L
         private const val USER_AGENT =
@@ -1206,34 +761,5 @@ class NetMirrorProvider : MainAPI() {
         private const val DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
-        private const val NEWTV_USER_AGENT =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) " +
-                "Gecko/20100101 Firefox/136.0 /OS.GatuNewTV v1.0"
-        private val NEWTV_DOMAINS = listOf(
-            "https://mobiledetects.com",
-            "https://mobiledetect.app",
-            "https://mobidetect.art",
-            "https://mobidetect.cc",
-            "https://mobidetect.click",
-            "https://mobidetect.ink",
-            "https://mobidetect.live",
-            "https://mobidetect.pro",
-            "https://mobidetect.shop",
-            "https://mobidetect.site",
-            "https://mobidetect.space",
-            "https://mobidetect.store",
-            "https://mobidetect.vip",
-            "https://mobidetect.wiki",
-            "https://mobidetect.xyz",
-            "https://mobiledetects.art",
-            "https://mobiledetects.cc",
-            "https://mobiledetects.info",
-            "https://mobiledetects.ink",
-            "https://mobiledetects.live",
-            "https://mobiledetects.pro",
-            "https://mobiledetects.store",
-            "https://mobiledetects.top",
-            "https://mobiledetects.xyz"
-        )
     }
 }
