@@ -925,20 +925,34 @@ class MovyAdvisoryOverlay private constructor(
 
     private fun inferRatingFromTags(tags: List<String>, isTv: Boolean): Pair<String, String> {
         val t = tags.joinToString(" ").lowercase()
-        return when {
-            t.contains("horror") || t.contains("crime") || t.contains("thriller") -> {
-                (if (isTv) "TV-MA" else "R") to "violence, fear"
+        val descList = linkedSetOf<String>()
+        if (t.contains("suicide") || t.contains("self-harm") || t.contains("depression")) descList.add("suicide, self-harm")
+        if (t.contains("violence") || t.contains("crime") || t.contains("gangster") || t.contains("mafia") || t.contains("murder") || t.contains("action")) descList.add("violence")
+        if (t.contains("drug") || t.contains("substance") || t.contains("alcohol") || t.contains("cocaine")) descList.add("substances")
+        if (t.contains("language") || t.contains("profanity")) descList.add("coarse language")
+        if (t.contains("sex") || t.contains("nudity") || t.contains("erotic") || t.contains("rape")) descList.add("sex, nudity")
+        if (t.contains("horror") || t.contains("fear") || t.contains("terror") || t.contains("gore")) descList.add("fear")
+
+        val badge = when {
+            descList.contains("suicide, self-harm") || t.contains("horror") || t.contains("crime") || t.contains("gangster") || t.contains("mafia") -> {
+                if (isTv) "TV-MA" else "R"
             }
             t.contains("action") || t.contains("war") -> {
-                (if (isTv) "TV-14" else "PG-13") to "violence, language"
+                if (isTv) "TV-14" else "PG-13"
             }
             t.contains("animation") || t.contains("family") || t.contains("comedy") -> {
-                (if (isTv) "TV-PG" else "PG") to "fear, mild themes"
+                if (isTv) "TV-PG" else "PG"
             }
             else -> {
-                (if (isTv) "TV-14" else "PG-13") to "language, violence"
+                if (isTv) "TV-MA" else "R"
             }
         }
+        val descriptors = if (descList.isNotEmpty()) {
+            descList.take(3).joinToString(", ")
+        } else {
+            if (badge == "R" || badge == "TV-MA") "violence, substances, coarse language" else "fear, violence"
+        }
+        return badge to descriptors
     }
 
     private fun applyMainText(overlay: OverlayViews, ratingBadge: String, descriptors: String?) {
@@ -1723,7 +1737,19 @@ class MovyAdvisoryOverlay private constructor(
 
             Thread {
                 try {
-                    val result = queryTmdb(clean, year, isTv) ?: queryOmdb(clean, year)
+                    val omdb = queryOmdb(clean, year)
+                    val tmdb = queryTmdb(clean, year, isTv)
+                    val result = when {
+                        omdb != null && tmdb != null -> {
+                            val badge = omdb.ratingBadge
+                            val desc = if (tmdb.descriptors.isNotBlank()) tmdb.descriptors else omdb.descriptors
+                            val tobacco = omdb.hasTobacco || tmdb.hasTobacco
+                            MetadataResult(badge, desc, tobacco)
+                        }
+                        omdb != null -> omdb
+                        tmdb != null -> tmdb
+                        else -> null
+                    }
                     if (result != null) {
                         cache[key] = result
                         Handler(Looper.getMainLooper()).post { onResult(result) }
@@ -1744,7 +1770,7 @@ class MovyAdvisoryOverlay private constructor(
         private fun queryTmdb(title: String, year: Int?, isTv: Boolean): MetadataResult? {
             return try {
                 val encoded = URLEncoder.encode(title, "UTF-8")
-                val searchUrl = "https://api.tmdb.org/3/search/multi?api_key=$TMDB_API_KEY&query=$encoded"
+                val searchUrl = "https://db.wecollege.net/3/search/multi?query=$encoded"
                 val jsonStr = httpGet(searchUrl) ?: return null
                 val root = JSONObject(jsonStr)
                 val results = root.optJSONArray("results") ?: return null
@@ -1762,10 +1788,10 @@ class MovyAdvisoryOverlay private constructor(
                 val keywordsList = mutableListOf<String>()
 
                 if (mediaType == "tv") {
-                    val crJson = httpGet("https://api.tmdb.org/3/tv/$id/content_ratings?api_key=$TMDB_API_KEY")
-                    if (crJson != null) {
-                        val crObj = JSONObject(crJson)
-                        val crResults = crObj.optJSONArray("results")
+                    val detailJson = httpGet("https://db.wecollege.net/3/tv/$id?append_to_response=content_ratings,keywords")
+                    if (detailJson != null) {
+                        val detailObj = JSONObject(detailJson)
+                        val crResults = detailObj.optJSONObject("content_ratings")?.optJSONArray("results")
                         if (crResults != null) {
                             var inRating: String? = null
                             var usRating: String? = null
@@ -1783,12 +1809,7 @@ class MovyAdvisoryOverlay private constructor(
                             }
                             ratingBadge = inRating ?: usRating ?: gbRating ?: anyRating
                         }
-                    }
-
-                    val kwJson = httpGet("https://api.tmdb.org/3/tv/$id/keywords?api_key=$TMDB_API_KEY")
-                    if (kwJson != null) {
-                        val kwObj = JSONObject(kwJson)
-                        val kwArr = kwObj.optJSONArray("results")
+                        val kwArr = detailObj.optJSONObject("keywords")?.optJSONArray("results")
                         if (kwArr != null) {
                             for (i in 0 until kwArr.length()) {
                                 val kw = kwArr.optJSONObject(i)?.optString("name")?.lowercase() ?: continue
@@ -1797,10 +1818,10 @@ class MovyAdvisoryOverlay private constructor(
                         }
                     }
                 } else {
-                    val relJson = httpGet("https://api.tmdb.org/3/movie/$id/release_dates?api_key=$TMDB_API_KEY")
-                    if (relJson != null) {
-                        val relObj = JSONObject(relJson)
-                        val relResults = relObj.optJSONArray("results")
+                    val detailJson = httpGet("https://db.wecollege.net/3/movie/$id?append_to_response=release_dates,keywords")
+                    if (detailJson != null) {
+                        val detailObj = JSONObject(detailJson)
+                        val relResults = detailObj.optJSONObject("release_dates")?.optJSONArray("results")
                         if (relResults != null) {
                             var inCert: String? = null
                             var usCert: String? = null
@@ -1822,12 +1843,7 @@ class MovyAdvisoryOverlay private constructor(
                             }
                             ratingBadge = inCert ?: usCert ?: gbCert ?: anyCert
                         }
-                    }
-
-                    val kwJson = httpGet("https://api.tmdb.org/3/movie/$id/keywords?api_key=$TMDB_API_KEY")
-                    if (kwJson != null) {
-                        val kwObj = JSONObject(kwJson)
-                        val kwArr = kwObj.optJSONArray("keywords")
+                        val kwArr = detailObj.optJSONObject("keywords")?.optJSONArray("keywords")
                         if (kwArr != null) {
                             for (i in 0 until kwArr.length()) {
                                 val kw = kwArr.optJSONObject(i)?.optString("name")?.lowercase() ?: continue

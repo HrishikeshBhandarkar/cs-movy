@@ -182,7 +182,7 @@ class MovyProvider : MainAPI() {
         }
 
         val detail = runCatching {
-            JSONObject(app.get("$DB/$type/$id?append_to_response=external_ids,images,credits", headers = headers).text)
+            JSONObject(app.get("$DB/$type/$id?append_to_response=external_ids,images,credits,release_dates,content_ratings,keywords", headers = headers).text)
         }.getOrNull() ?: return null
 
         val title = detail.str("title") ?: detail.str("name") ?: return null
@@ -196,6 +196,70 @@ class MovyProvider : MainAPI() {
         val genres = detail.optJSONArray("genres")?.let { arr ->
             (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.str("name") }
         }.orEmpty()
+
+        var contentRating: String? = null
+        if (type == "movie") {
+            val relResults = detail.optJSONObject("release_dates")?.optJSONArray("results")
+            if (relResults != null) {
+                var inCert: String? = null
+                var usCert: String? = null
+                var anyCert: String? = null
+                for (i in 0 until relResults.length()) {
+                    val r = relResults.optJSONObject(i) ?: continue
+                    val country = r.optString("iso_3166_1")
+                    val dates = r.optJSONArray("release_dates") ?: continue
+                    for (j in 0 until dates.length()) {
+                        val d = dates.optJSONObject(j) ?: continue
+                        val cert = d.optString("certification").trim()
+                        if (cert.isBlank()) continue
+                        if (country == "IN" && inCert == null) inCert = cert
+                        if (country == "US" && usCert == null) usCert = cert
+                        if (anyCert == null) anyCert = cert
+                    }
+                }
+                contentRating = inCert ?: usCert ?: anyCert
+            }
+        } else {
+            val crResults = detail.optJSONObject("content_ratings")?.optJSONArray("results")
+            if (crResults != null) {
+                var inRating: String? = null
+                var usRating: String? = null
+                var anyRating: String? = null
+                for (i in 0 until crResults.length()) {
+                    val r = crResults.optJSONObject(i) ?: continue
+                    val country = r.optString("iso_3166_1")
+                    val ratingStr = r.optString("rating").trim()
+                    if (ratingStr.isBlank()) continue
+                    if (country == "IN" && inRating == null) inRating = ratingStr
+                    if (country == "US" && usRating == null) usRating = ratingStr
+                    if (anyRating == null) anyRating = ratingStr
+                }
+                contentRating = inRating ?: usRating ?: anyRating
+            }
+        }
+        val rawKeywords = if (type == "movie") {
+            detail.optJSONObject("keywords")?.optJSONArray("keywords")
+        } else {
+            detail.optJSONObject("keywords")?.optJSONArray("results")
+        }
+        val advisoryDescriptors = mutableListOf<String>()
+        if (rawKeywords != null) {
+            val kwSet = linkedSetOf<String>()
+            for (i in 0 until rawKeywords.length()) {
+                val name = rawKeywords.optJSONObject(i)?.optString("name")?.lowercase() ?: continue
+                when {
+                    name.contains("suicide") || name.contains("self-harm") || name.contains("depression") -> kwSet.add("suicide, self-harm")
+                    name.contains("violence") || name.contains("murder") || name.contains("gangster") || name.contains("mafia") || name.contains("kill") -> kwSet.add("violence")
+                    name.contains("drug") || name.contains("substance") || name.contains("cocaine") || name.contains("alcohol") -> kwSet.add("substances")
+                    name.contains("profanity") || name.contains("swearing") || name.contains("language") -> kwSet.add("coarse language")
+                    name.contains("sex") || name.contains("nudity") || name.contains("rape") -> kwSet.add("sex, nudity")
+                    name.contains("smoking") || name.contains("tobacco") || name.contains("cigarette") || name.contains("cigar") -> kwSet.add("tobacco use")
+                }
+            }
+            advisoryDescriptors.addAll(kwSet.take(3))
+        }
+
+        val finalTags = (listOfNotNull(contentRating) + advisoryDescriptors + genres).distinct()
 
         val actors = detail.optJSONObject("credits")?.optJSONArray("cast")?.let { castArr ->
             (0 until minOf(castArr.length(), 10)).mapNotNull { i ->
@@ -235,7 +299,7 @@ class MovyProvider : MainAPI() {
                 this.logoUrl = logoUrl
                 this.plot = plot
                 this.year = year
-                this.tags = genres
+                this.tags = finalTags
                 this.duration = runtime
                 this.score = score
             }
@@ -274,7 +338,7 @@ class MovyProvider : MainAPI() {
             this.logoUrl = logoUrl
             this.plot = plot
             this.year = year
-            this.tags = genres
+            this.tags = finalTags
             this.score = score
         }
     }

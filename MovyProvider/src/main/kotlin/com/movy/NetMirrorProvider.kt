@@ -31,7 +31,7 @@ import org.jsoup.nodes.Document
 import java.util.UUID
 
 class NetMirrorProvider : MainAPI() {
-    override var mainUrl = "https://net52.cc"
+    override var mainUrl = "https://net77.cc"
     override var name = "NetMirror"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"
@@ -42,7 +42,7 @@ class NetMirrorProvider : MainAPI() {
     override val mainPage = mainPageOf("" to "Home")
 
     private val headers = mapOf(
-        "User-Agent" to USER_AGENT,
+        "User-Agent" to DESKTOP_UA,
         "Accept" to "application/json, text/javascript, text/html, */*; q=0.01",
         "Accept-Language" to "en-IN,en-US;q=0.9,en;q=0.8",
         "X-Requested-With" to "XMLHttpRequest"
@@ -78,7 +78,7 @@ class NetMirrorProvider : MainAPI() {
         referer: String
     ): Map<String, String> {
         val result = mutableMapOf(
-            "User-Agent" to USER_AGENT,
+            "User-Agent" to DESKTOP_UA,
             "Accept" to "*/*",
             "Referer" to referer,
             "Origin" to mainUrl
@@ -234,10 +234,10 @@ class NetMirrorProvider : MainAPI() {
     private suspend fun homeDocument(): Document? {
         var response = runCatching {
             app.get(
-                "$mainUrl/mobile/home?app=1",
+                "$mainUrl/home",
                 headers = headers,
                 cookies = session(),
-                referer = "$mainUrl/mobile/home?app=1"
+                referer = "$mainUrl/"
             )
         }.getOrNull() ?: return null
         if (response.code == 403 ||
@@ -246,10 +246,10 @@ class NetMirrorProvider : MainAPI() {
         ) {
             response = runCatching {
                 app.get(
-                    "$mainUrl/mobile/home?app=1",
+                    "$mainUrl/home",
                     headers = headers,
                     cookies = session(force = true),
-                    referer = "$mainUrl/mobile/home?app=1"
+                    referer = "$mainUrl/"
                 )
             }.getOrNull() ?: return null
         }
@@ -292,9 +292,9 @@ class NetMirrorProvider : MainAPI() {
         if (query.isBlank()) return emptyList()
         val json = runCatching {
             getJson(
-                "$mainUrl/mobile/search.php",
+                "$mainUrl/search.php",
                 mapOf("s" to query, "t" to now(), "ADSearch" to "false"),
-                "$mainUrl/mobile/home?app=1"
+                "$mainUrl/"
             )
         }.getOrNull() ?: return emptyList()
 
@@ -327,9 +327,9 @@ class NetMirrorProvider : MainAPI() {
 
     private suspend fun fetchPost(id: String): JSONObject? = runCatching {
         getJson(
-            "$mainUrl/mobile/post.php",
+            "$mainUrl/post.php",
             mapOf("id" to id, "t" to now()),
-            "$mainUrl/mobile/home?app=1"
+            "$mainUrl/"
         )
     }.getOrNull()
 
@@ -380,9 +380,9 @@ class NetMirrorProvider : MainAPI() {
 
         var post = runCatching {
             getJson(
-                "$mainUrl/mobile/post.php",
+                "$mainUrl/post.php",
                 mapOf("id" to id, "t" to now()),
-                "$mainUrl/mobile/home?app=1"
+                "$mainUrl/"
             )
         }.getOrNull() ?: return null
 
@@ -390,9 +390,9 @@ class NetMirrorProvider : MainAPI() {
             session(force = true)
             post = runCatching {
                 getJson(
-                    "$mainUrl/mobile/post.php",
+                    "$mainUrl/post.php",
                     mapOf("id" to id, "t" to now()),
-                    "$mainUrl/mobile/home?app=1"
+                    "$mainUrl/"
                 )
             }.getOrNull() ?: return null
         }
@@ -404,6 +404,13 @@ class NetMirrorProvider : MainAPI() {
             .split(",")
             .map { it.trim() }
             .filter { it.isNotBlank() }
+        val uaRating = post.optString("ua").trim()
+        val mReason = post.optString("m_reason").trim()
+        val finalTags = mutableListOf<String>()
+        if (uaRating.isNotBlank()) finalTags.add(uaRating)
+        if (mReason.isNotBlank()) finalTags.add(mReason)
+        finalTags.addAll(tags)
+
         val actors = post.optString("cast")
             .split(",")
             .map { it.trim() }
@@ -426,7 +433,7 @@ class NetMirrorProvider : MainAPI() {
                 this.backgroundPosterUrl = widePoster(id)
                 this.plot = plot
                 this.year = year
-                this.tags = tags
+                this.tags = finalTags
                 this.actors = actors
                 this.duration = duration
                 this.recommendations = suggestions
@@ -469,7 +476,7 @@ class NetMirrorProvider : MainAPI() {
             this.backgroundPosterUrl = widePoster(id)
             this.plot = plot
             this.year = year
-            this.tags = tags
+            this.tags = finalTags
             this.actors = actors
             this.recommendations = suggestions
         }
@@ -494,9 +501,9 @@ class NetMirrorProvider : MainAPI() {
             if (page > 1) params["page"] = page.toString()
             val json = runCatching {
                 getJson(
-                    "$mainUrl/mobile/episodes.php",
+                    "$mainUrl/episodes.php",
                     params,
-                    "$mainUrl/mobile/post.php?id=$seriesId"
+                    "$mainUrl/post.php?id=$seriesId"
                 )
             }.getOrNull() ?: break
 
@@ -550,15 +557,15 @@ class NetMirrorProvider : MainAPI() {
         val playlistHeaders = headers + mapOf(
             "Cookie" to cookieHeader(cookies),
             "Usertoken" to cookies["user_token"].orEmpty(),
-            "Referer" to "$mainUrl/mobile/home?app=1"
+            "Referer" to "$mainUrl/"
         )
         var playlistResponse = runCatching {
             app.get(
-                "$mainUrl/mobile/playlist.php",
+                "$mainUrl/playlist.php",
                 params = playlistParams,
                 headers = playlistHeaders,
                 cookies = cookies,
-                referer = "$mainUrl/mobile/home?app=1"
+                referer = "$mainUrl/"
             )
         }.getOrNull() ?: return false
 
@@ -568,15 +575,15 @@ class NetMirrorProvider : MainAPI() {
             lastCookies = cookies
             playlistResponse = runCatching {
                 app.get(
-                    "$mainUrl/mobile/playlist.php",
+                    "$mainUrl/playlist.php",
                     params = playlistParams,
                     headers = headers + mapOf(
                         "Cookie" to cookieHeader(cookies),
                         "Usertoken" to cookies["user_token"].orEmpty(),
-                        "Referer" to "$mainUrl/mobile/home?app=1"
+                        "Referer" to "$mainUrl/"
                     ),
                     cookies = cookies,
-                    referer = "$mainUrl/mobile/home?app=1"
+                    referer = "$mainUrl/"
                 )
             }.getOrNull() ?: return false
             playlist = playlistResponse.text
@@ -605,15 +612,15 @@ class NetMirrorProvider : MainAPI() {
             lastCookies = cookies
             playlist = runCatching {
                 app.get(
-                    "$mainUrl/mobile/playlist.php",
+                    "$mainUrl/playlist.php",
                     params = playlistParams,
                     headers = headers + mapOf(
                         "Cookie" to cookieHeader(cookies),
                         "Usertoken" to cookies["user_token"].orEmpty(),
-                        "Referer" to "$mainUrl/mobile/home?app=1"
+                        "Referer" to "$mainUrl/"
                     ),
                     cookies = cookies,
-                    referer = "$mainUrl/mobile/home?app=1"
+                    referer = "$mainUrl/"
                 ).text
             }.getOrNull().orEmpty()
             array = runCatching { JSONArray(playlist) }.getOrNull()
