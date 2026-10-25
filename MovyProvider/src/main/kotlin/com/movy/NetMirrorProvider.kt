@@ -550,15 +550,22 @@ class NetMirrorProvider : MainAPI() {
             )
         }
 
-        val playlistParams = mapOf(
+        val playToken = fetchPlayToken(loadData.id, cookies)
+
+        val playlistParams = mutableMapOf(
             "id" to loadData.id,
             "t" to loadData.title,
             "tm" to now()
         )
+        if (!playToken.isNullOrBlank()) {
+            playlistParams["h"] = playToken
+        }
+
         val playlistHeaders = headers + mapOf(
+            "Origin" to mainUrl,
+            "Referer" to "$mainUrl/home",
             "Cookie" to cookieHeader(cookies),
-            "Usertoken" to cookies["user_token"].orEmpty(),
-            "Referer" to "$mainUrl/"
+            "Usertoken" to cookies["user_token"].orEmpty()
         )
         var playlistResponse = runCatching {
             app.get(
@@ -566,7 +573,7 @@ class NetMirrorProvider : MainAPI() {
                 params = playlistParams,
                 headers = playlistHeaders,
                 cookies = cookies,
-                referer = "$mainUrl/"
+                referer = "$mainUrl/home"
             )
         }.getOrNull() ?: return false
 
@@ -579,12 +586,13 @@ class NetMirrorProvider : MainAPI() {
                     "$mainUrl/playlist.php",
                     params = playlistParams,
                     headers = headers + mapOf(
+                        "Origin" to mainUrl,
+                        "Referer" to "$mainUrl/home",
                         "Cookie" to cookieHeader(cookies),
-                        "Usertoken" to cookies["user_token"].orEmpty(),
-                        "Referer" to "$mainUrl/"
+                        "Usertoken" to cookies["user_token"].orEmpty()
                     ),
                     cookies = cookies,
-                    referer = "$mainUrl/"
+                    referer = "$mainUrl/home"
                 )
             }.getOrNull() ?: return false
             playlist = playlistResponse.text
@@ -616,12 +624,13 @@ class NetMirrorProvider : MainAPI() {
                     "$mainUrl/playlist.php",
                     params = playlistParams,
                     headers = headers + mapOf(
+                        "Origin" to mainUrl,
+                        "Referer" to "$mainUrl/home",
                         "Cookie" to cookieHeader(cookies),
-                        "Usertoken" to cookies["user_token"].orEmpty(),
-                        "Referer" to "$mainUrl/"
+                        "Usertoken" to cookies["user_token"].orEmpty()
                     ),
                     cookies = cookies,
-                    referer = "$mainUrl/"
+                    referer = "$mainUrl/home"
                 ).text
             }.getOrNull().orEmpty()
             array = runCatching { JSONArray(playlist) }.getOrNull()
@@ -637,14 +646,14 @@ class NetMirrorProvider : MainAPI() {
         val item = array.optJSONObject(0) ?: return false
         val sources = item.optJSONArray("sources") ?: return false
 
-        val playToken = fetchPlayToken(loadData.id, cookies)
-
         var found = false
-        val streamHeaders = streamRequestHeaders(cookies, "$mainUrl/")
+        val streamHeaders = streamRequestHeaders(cookies, "$mainUrl/home")
+        val validSources = mutableListOf<Pair<JSONObject, String>>()
+        var punishment = false
+
         for (i in 0 until sources.length()) {
             val source = sources.optJSONObject(i) ?: continue
             val file = source.optString("file").takeIf { it.isNotBlank() } ?: continue
-            val label = source.optString("label").ifBlank { "NetMirror" }
             var url = if (file.startsWith("http")) file else "$mainUrl$file"
 
             if (!playToken.isNullOrBlank()) {
@@ -657,6 +666,41 @@ class NetMirrorProvider : MainAPI() {
                 }
             }
 
+            val probeManifest = runCatching {
+                app.get(
+                    url,
+                    headers = streamHeaders,
+                    cookies = cookies,
+                    referer = "$mainUrl/home"
+                ).text
+            }.getOrNull().orEmpty()
+
+            if (probeManifest.contains("/220884/") ||
+                probeManifest.contains("Only Valid Users Allowed", ignoreCase = true)
+            ) {
+                Log.w(TAG, "NetMirror served abuse punishment video 220884 for $url")
+                punishment = true
+                continue
+            }
+
+            validSources.add(source to url)
+        }
+
+        if (validSources.isEmpty()) {
+            if (punishment) {
+                Log.w(TAG, "NetMirror served only abuse punishment video 220884; rejecting stream")
+                NetMirrorSettings.showLogin(
+                    "NetMirror session expired or locked (abuse video 220884). Please log in or paste a fresh user_token, then retry."
+                )
+                throw ErrorLoadingException(
+                    "NetMirror session expired or locked. Complete the login popup, then retry."
+                )
+            }
+            return false
+        }
+
+        for ((source, url) in validSources) {
+            val label = source.optString("label").ifBlank { "NetMirror" }
             callback.invoke(
                 newExtractorLink(
                     source = name,
@@ -664,7 +708,7 @@ class NetMirrorProvider : MainAPI() {
                     url = url,
                     type = ExtractorLinkType.M3U8
                 ) {
-                    this.referer = "$mainUrl/"
+                    this.referer = "$mainUrl/home"
                     this.quality = qualityOf(label)
                     this.headers = streamHeaders
                 }
@@ -730,8 +774,8 @@ class NetMirrorProvider : MainAPI() {
         val playHeaders = mutableMapOf(
             "User-Agent" to DESKTOP_UA,
             "Origin" to mainUrl,
-            "Referer" to "$mainUrl/",
-            "Content-Type" to "application/x-www-form-urlencoded",
+            "Referer" to "$mainUrl/home",
+            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With" to "XMLHttpRequest"
         )
         val cookie = cookieHeader(cookies)
@@ -744,7 +788,7 @@ class NetMirrorProvider : MainAPI() {
                 data = mapOf("id" to id),
                 headers = playHeaders,
                 cookies = cookies,
-                referer = "$mainUrl/"
+                referer = "$mainUrl/home"
             )
             val json = JSONObject(response.text)
             val token = json.optString("h").takeIf { it.isNotBlank() }
@@ -759,6 +803,13 @@ class NetMirrorProvider : MainAPI() {
         val lines = manifest.lines()
         val result = mutableListOf<String>()
         var strippedAudioGroup: String? = null
+
+        if (manifest.contains("/220884/") || manifest.contains("Only Valid Users Allowed", ignoreCase = true)) {
+            Log.w(TAG, "NetMirror served abuse punishment video 220884 in M3U8")
+            NetMirrorSettings.showLogin(
+                "NetMirror session expired or locked (abuse 220884). Please log in or paste a fresh user_token, then retry."
+            )
+        }
 
         for (line in lines) {
             val trimmed = line.trim()
@@ -800,6 +851,7 @@ class NetMirrorProvider : MainAPI() {
 
             val cookies = if (lastCookies.isNotEmpty()) lastCookies else currentCookies()
             val userToken = cookies["user_token"] ?: NetMirrorStore.userToken()
+            val cookie = cookieHeader(cookies)
 
             val isCdn = host.contains("freecdn") || host.contains("nm-cdn")
             if (isCdn) {
@@ -810,17 +862,23 @@ class NetMirrorProvider : MainAPI() {
             } else {
                 extractorLink.referer.takeIf { it.isNotBlank() }?.let {
                     builder.header("Referer", it)
-                }
+                } ?: builder.header("Referer", "$mainUrl/home")
                 if (host.contains("net52") ||
                     host.contains("net77") ||
                     host.contains("subscdn") ||
                     host.contains("imgcdn")
                 ) {
                     builder.header("Origin", mainUrl)
-                    val cookie = cookieHeader(cookies)
-                    if (cookie.isNotBlank()) builder.header("Cookie", cookie)
-                    userToken?.takeIf { it.isNotBlank() }?.let { builder.header("Usertoken", it) }
+                    builder.header("User-Agent", DESKTOP_UA)
                 }
+            }
+
+            // Always forward user cookie data and Usertoken to all endpoints (both CDN and origin)
+            if (cookie.isNotBlank()) {
+                builder.header("Cookie", cookie)
+            }
+            userToken?.takeIf { it.isNotBlank() }?.let {
+                builder.header("Usertoken", it)
             }
 
             val response = chain.proceed(builder.build())

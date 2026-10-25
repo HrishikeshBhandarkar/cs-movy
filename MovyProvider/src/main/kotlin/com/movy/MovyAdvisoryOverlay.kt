@@ -70,9 +70,28 @@ class MovyAdvisoryOverlay private constructor(
     private var mainState = AdvisoryState.NOT_SHOWN
     private var tobaccoState = AdvisoryState.NOT_SHOWN
     private var hasTobacco = false
+    private var hasAlcoholOrDrugs = false
+    private var statutoryWarningText: String? = null
+    private val hasStatutoryWarning: Boolean
+        get() = statutoryWarningText != null || hasTobacco || hasAlcoholOrDrugs
 
     private var lastResolvedTitle: String? = null
     private var lastEpisodeKey: String? = null
+    private var completedEpisodeKey: String? = null
+    private var mainShowStartTimeMs = 0L
+
+    private var mainHoldRunnable: Runnable? = null
+    private var statutoryQueueRunnable: Runnable? = null
+    private var statutoryHoldRunnable: Runnable? = null
+
+    private fun cancelPendingTimers() {
+        mainHoldRunnable?.let { handler.removeCallbacks(it) }
+        mainHoldRunnable = null
+        statutoryQueueRunnable?.let { handler.removeCallbacks(it) }
+        statutoryQueueRunnable = null
+        statutoryHoldRunnable?.let { handler.removeCallbacks(it) }
+        statutoryHoldRunnable = null
+    }
 
     private var controlsVisible = false
     private var playbackRunning = false
@@ -264,6 +283,7 @@ class MovyAdvisoryOverlay private constructor(
         // Pre-fetch metadata immediately upon attachment
         prefetchAndApplyMetadata(overlay, playerFragment, player)
 
+        handler.removeCallbacks(pollRunnable)
         handler.postAtTime(pollRunnable, activeSession, SystemClock.uptimeMillis())
 
         root.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
@@ -386,16 +406,20 @@ class MovyAdvisoryOverlay private constructor(
         if (currentEpKey != null && currentEpKey != lastEpisodeKey) {
             Log.i(TAG, "New episode detected ($lastEpisodeKey -> $currentEpKey): resetting advisories")
             lastEpisodeKey = currentEpKey
+            completedEpisodeKey = null
             resetForNewEpisode(player)
             return
         }
 
-        // Detect seek back to beginning (< 5s after past 15s)
+        // Detect seek back to beginning (< 5s after past 15s) in same episode
         val currentPos = playerPosition(player)
         if (currentPos != null && currentPos < 5000L && lastPosition > 15000L) {
-            Log.i(TAG, "playback restarted from beginning: resetting advisories")
-            resetForNewEpisode(player)
-            return
+            if (currentEpKey == lastEpisodeKey) {
+                Log.i(TAG, "playback restarted from beginning: resetting advisories")
+                completedEpisodeKey = null
+                resetForNewEpisode(player)
+                return
+            }
         }
 
         val running = isPlaybackRunning(player, fragment)
@@ -408,10 +432,17 @@ class MovyAdvisoryOverlay private constructor(
         // 2. Terminate immediately if video is buffering, paused, or stopped!
         if (!playbackRunning) {
             if (mainState == AdvisoryState.SHOWING) {
+                val elapsed = if (mainShowStartTimeMs > 0L) now - mainShowStartTimeMs else 0L
                 stopAnimations()
                 hideAdvisoryViews()
-                mainState = AdvisoryState.INTERRUPTED
-                Log.i(TAG, "video buffering/paused: main advisory terminated")
+                if (elapsed >= 1800L) {
+                    mainState = AdvisoryState.DONE
+                    completedEpisodeKey = lastEpisodeKey
+                    Log.i(TAG, "video buffering/paused after ${elapsed}ms: advisory marked DONE (no duplicate replay)")
+                } else {
+                    mainState = AdvisoryState.INTERRUPTED
+                    Log.i(TAG, "video buffering/paused: main advisory terminated (interrupted)")
+                }
             }
             if (tobaccoState == AdvisoryState.SHOWING || tobaccoState == AdvisoryState.QUEUED) {
                 stopTobaccoAnimations()
@@ -428,9 +459,15 @@ class MovyAdvisoryOverlay private constructor(
             if (!controlsVisible) {
                 controlsVisible = true
                 if (mainState == AdvisoryState.SHOWING) {
+                    val elapsed = if (mainShowStartTimeMs > 0L) now - mainShowStartTimeMs else 0L
                     stopAnimations()
                     hideAdvisoryViews()
-                    mainState = AdvisoryState.INTERRUPTED
+                    if (elapsed >= 1800L) {
+                        mainState = AdvisoryState.DONE
+                        completedEpisodeKey = lastEpisodeKey
+                    } else {
+                        mainState = AdvisoryState.INTERRUPTED
+                    }
                     Log.i(TAG, "player controls shown: main advisory terminated")
                 }
                 if (tobaccoState == AdvisoryState.SHOWING || tobaccoState == AdvisoryState.QUEUED) {
@@ -449,13 +486,15 @@ class MovyAdvisoryOverlay private constructor(
         }
 
         // 4. Execution State Machine (Only runs when playback is normal and controls are hidden)
-        if (mainState != AdvisoryState.DONE) {
+        if (currentEpKey != null && currentEpKey == completedEpisodeKey && (mainState == AdvisoryState.DONE || mainState == AdvisoryState.NOT_SHOWN)) {
+            // Already completed for this episode; do not display twice!
+        } else if (mainState != AdvisoryState.DONE) {
             if (mainState == AdvisoryState.NOT_SHOWN || mainState == AdvisoryState.INTERRUPTED) {
-                if (canStart(now)) {
+                if (canStart(now) && currentEpKey != completedEpisodeKey) {
                     startSequence()
                 }
             }
-        } else if (hasTobacco && tobaccoState != AdvisoryState.DONE) {
+        } else if (hasStatutoryWarning && tobaccoState != AdvisoryState.DONE) {
             // Only resume if interrupted (QUEUED is handled exclusively by the delay timer)
             if (tobaccoState == AdvisoryState.INTERRUPTED) {
                 if (canStart(now)) {
@@ -470,7 +509,7 @@ class MovyAdvisoryOverlay private constructor(
                 TAG,
                 "heartbeat status=${playerStatusName(fragment)} exoPlaying=${exoPlayerIsPlaying(player)} " +
                     "pos=$currentPos uiShowing=$uiVisible mainState=$mainState " +
-                    "tobaccoState=$tobaccoState hasTobacco=$hasTobacco running=$playbackRunning canStart=${canStart(now)}"
+                    "tobaccoState=$tobaccoState hasStatutory=$hasStatutoryWarning running=$playbackRunning canStart=${canStart(now)}"
             )
         }
     }
@@ -479,14 +518,17 @@ class MovyAdvisoryOverlay private constructor(
         playbackRunning && (now - playbackAnchorMs) >= START_DELAY_MS
 
     private fun resetForNewEpisode(player: ViewGroup) {
+        cancelPendingTimers()
         stopAnimations()
         stopTobaccoAnimations()
         hideAdvisoryViews()
         hideTobaccoViews()
         mainState = AdvisoryState.NOT_SHOWN
         tobaccoState = AdvisoryState.NOT_SHOWN
+        mainShowStartTimeMs = 0L
         playbackAnchorMs = SystemClock.uptimeMillis()
         lastPosition = -1L
+        lastPositionAt = 0L
         lastResolvedTitle = null
         lockedRibbonHeight = 0
 
@@ -506,6 +548,14 @@ class MovyAdvisoryOverlay private constructor(
             val metaEp = meta?.let { invokeDeclared(it, "getEpisode") }
             val metaName = meta?.let { invokeDeclared(it, "getName") }
 
+            // If generator state has episode information, use ONLY stable generator keys!
+            // NEVER append mutable TextView titles to the episode key because TextView titles
+            // update asynchronously hundreds of milliseconds later, causing duplicate triggers.
+            if (epId != null || epIndex != null || metaEp != null) {
+                val epKey = "ep_${instance ?: 0}_${epId ?: "none"}_${epIndex ?: "none"}_${metaEp ?: "none"}_${metaName ?: ""}".trim('_')
+                if (epKey.isNotBlank()) return epKey
+            }
+
             var playerTitle: String? = null
             var playerSubTitle: String? = null
             if (player != null) {
@@ -521,7 +571,7 @@ class MovyAdvisoryOverlay private constructor(
                 }
             }
 
-            val key = "${instance}_${epIndex}_${epId}_${metaEp}_${metaName}_${playerTitle}_${playerSubTitle}".trim('_')
+            val key = "movie_${instance ?: 0}_${playerTitle ?: ""}_${playerSubTitle ?: ""}".trim('_')
             if (key.isNotBlank()) key else null
         } catch (t: Throwable) {
             null
@@ -842,11 +892,22 @@ class MovyAdvisoryOverlay private constructor(
             }
         }
 
-        // Tobacco detection from local metadata
+        // Tobacco & alcohol/substance detection from local metadata
         val textToScan = (descriptors.orEmpty() + " " + localTags.joinToString() + " " + plot).lowercase()
-        hasTobacco = textToScan.contains("tobacco") || textToScan.contains("smoking") ||
+        val localTobacco = textToScan.contains("tobacco") || textToScan.contains("smoking") ||
             textToScan.contains("cigarette") || textToScan.contains("cigar") ||
-            textToScan.contains("nicotine") || textToScan.contains("substance")
+            textToScan.contains("nicotine")
+        val localAlcohol = textToScan.contains("alcohol") || textToScan.contains("drinking") ||
+            textToScan.contains("beer") || textToScan.contains("wine") || textToScan.contains("liquor")
+        val localDrugs = textToScan.contains("drug") || textToScan.contains("substance") ||
+            textToScan.contains("cocaine") || textToScan.contains("heroin") || textToScan.contains("marijuana")
+
+        hasTobacco = localTobacco
+        hasAlcoholOrDrugs = localAlcohol || localDrugs
+        val initStatutory = buildStatutoryWarningText(localTobacco, localAlcohol, localDrugs)
+        if (initStatutory != null) {
+            applyStatutoryText(overlay, initStatutory)
+        }
 
         if (!ratingBadge.isNullOrBlank()) {
             applyMainText(overlay, ratingBadge, descriptors)
@@ -860,12 +921,36 @@ class MovyAdvisoryOverlay private constructor(
         if (title != lastResolvedTitle) {
             lastResolvedTitle = title
             MetadataRatingFetcher.fetch(title, year, isTv) { result ->
-                Log.i(TAG, "Real API Rating resolved: badge=${result.ratingBadge}, desc=${result.descriptors}, tobacco=${result.hasTobacco}")
+                Log.i(TAG, "Real API Rating resolved: badge=${result.ratingBadge}, desc=${result.descriptors}, statutory=${result.statutoryWarningText}")
                 applyMainText(overlay, result.ratingBadge, result.descriptors)
                 if (result.hasTobacco) hasTobacco = true
+                if (result.hasAlcohol || result.hasDrugs) hasAlcoholOrDrugs = true
+                val statText = result.statutoryWarningText ?: buildStatutoryWarningText(hasTobacco, result.hasAlcohol, result.hasDrugs)
+                if (statText != null) {
+                    applyStatutoryText(overlay, statText)
+                }
                 syncRibbonHeights(overlay)
             }
         }
+    }
+
+    private fun buildStatutoryWarningText(hasTobacco: Boolean, hasAlcohol: Boolean, hasDrugs: Boolean): String? {
+        return when {
+            hasTobacco && (hasAlcohol || hasDrugs) -> "Consumption of tobacco & alcohol is injurious to health"
+            hasAlcohol && hasDrugs -> "Consumption of alcohol & drugs is injurious to health"
+            hasAlcohol -> "Consumption of alcohol is injurious to health"
+            hasDrugs -> "Consumption of alcohol & drugs is injurious to health"
+            hasTobacco -> "Consumption of tobacco products is injurious to health"
+            else -> null
+        }
+    }
+
+    private fun applyStatutoryText(overlay: OverlayViews, text: String) {
+        statutoryWarningText = text
+        overlay.tobaccoText.text = text
+        overlay.tobaccoContainer.contentDescription = "Content advisory: $text"
+        overlay.tobaccoText.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED)
+        syncRibbonHeights(overlay)
     }
 
     private data class ExtractedInfo(
@@ -971,6 +1056,7 @@ class MovyAdvisoryOverlay private constructor(
     private fun startSequence() {
         val overlay = overlayViews ?: return
         val player = playerRef?.get() ?: return
+        cancelPendingTimers()
         stopAnimations()
 
         val accentColor = getAccentColor(player.context)
@@ -993,6 +1079,7 @@ class MovyAdvisoryOverlay private constructor(
         overlay.root.bringToFront()
 
         mainState = AdvisoryState.SHOWING
+        mainShowStartTimeMs = SystemClock.uptimeMillis()
         Log.i(TAG, "main advisory choreography started! state=$mainState")
 
         enterSet = buildEnterAnimators(overlay).apply {
@@ -1000,11 +1087,13 @@ class MovyAdvisoryOverlay private constructor(
                 override fun onAnimationEnd(animation: Animator) {
                     if (mainState != AdvisoryState.SHOWING) return
                     // Hold for exactly 3 seconds after in-animation finishes!
-                    handler.postDelayed({
+                    val hold = Runnable {
                         if (mainState == AdvisoryState.SHOWING && !controlsVisible && playbackRunning) {
                             startExit(overlay)
                         }
-                    }, HOLD_MS)
+                    }
+                    mainHoldRunnable = hold
+                    handler.postDelayed(hold, HOLD_MS)
                 }
             })
             start()
@@ -1018,20 +1107,23 @@ class MovyAdvisoryOverlay private constructor(
                     if (mainState != AdvisoryState.SHOWING) return
                     hideAdvisoryViews()
                     mainState = AdvisoryState.DONE
-                    Log.i(TAG, "main advisory choreography completed (state=DONE)")
+                    completedEpisodeKey = lastEpisodeKey
+                    Log.i(TAG, "main advisory choreography completed (state=DONE, epKey=$completedEpisodeKey)")
 
-                    // If tobacco depiction exists, queue the statutory anti-tobacco advisory smoothly
-                    if (hasTobacco && tobaccoState == AdvisoryState.NOT_SHOWN) {
+                    // If statutory warning exists, queue the statutory advisory smoothly
+                    if (hasStatutoryWarning && tobaccoState == AdvisoryState.NOT_SHOWN) {
                         tobaccoState = AdvisoryState.QUEUED
-                        handler.postDelayed({
-                            if (tobaccoState != AdvisoryState.QUEUED) return@postDelayed
+                        val qRunnable = Runnable {
+                            if (tobaccoState != AdvisoryState.QUEUED) return@Runnable
                             val p = playerRef?.get()
                             if (p != null && isPlaybackRunning(p, playerFragment) && !controlsVisible) {
                                 startTobaccoSequence()
                             } else {
                                 tobaccoState = AdvisoryState.INTERRUPTED
                             }
-                        }, TOBACCO_GAP_AFTER_MAIN_MS)
+                        }
+                        statutoryQueueRunnable = qRunnable
+                        handler.postDelayed(qRunnable, TOBACCO_GAP_AFTER_MAIN_MS)
                     }
                 }
             })
@@ -1169,6 +1261,8 @@ class MovyAdvisoryOverlay private constructor(
     }
 
     private fun stopAnimations() {
+        mainHoldRunnable?.let { handler.removeCallbacks(it) }
+        mainHoldRunnable = null
         enterSet?.cancel()
         enterSet = null
         exitSet?.cancel()
@@ -1176,7 +1270,7 @@ class MovyAdvisoryOverlay private constructor(
     }
 
     // ---------------------------------------------------------------------
-    // Statutory Anti-Tobacco Advisory Choreography (Separate Entity)
+    // Statutory Substance Advisory Choreography (Separate Entity)
     // ---------------------------------------------------------------------
 
     private fun startTobaccoSequence() {
@@ -1201,7 +1295,7 @@ class MovyAdvisoryOverlay private constructor(
         overlay.tobaccoContainer.bringToFront()
 
         tobaccoState = AdvisoryState.SHOWING
-        Log.i(TAG, "tobacco advisory sequence started! state=$tobaccoState")
+        Log.i(TAG, "statutory advisory sequence started! state=$tobaccoState")
 
         overlay.tobaccoContainer.post {
             if (tobaccoState != AdvisoryState.SHOWING) return@post
@@ -1216,11 +1310,13 @@ class MovyAdvisoryOverlay private constructor(
                     override fun onAnimationEnd(animation: Animator) {
                         if (tobaccoState != AdvisoryState.SHOWING) return
                         // Hold for exactly 3 seconds after in-animation finishes!
-                        handler.postDelayed({
+                        val hold = Runnable {
                             if (tobaccoState == AdvisoryState.SHOWING && !controlsVisible && playbackRunning) {
                                 startTobaccoExit(overlay)
                             }
-                        }, HOLD_MS)
+                        }
+                        statutoryHoldRunnable = hold
+                        handler.postDelayed(hold, HOLD_MS)
                     }
                 })
                 start()
@@ -1235,7 +1331,7 @@ class MovyAdvisoryOverlay private constructor(
                     if (tobaccoState != AdvisoryState.SHOWING) return
                     hideTobaccoViews()
                     tobaccoState = AdvisoryState.DONE
-                    Log.i(TAG, "tobacco advisory completed (state=DONE)")
+                    Log.i(TAG, "statutory advisory completed (state=DONE)")
                 }
             })
             start()
@@ -1331,6 +1427,10 @@ class MovyAdvisoryOverlay private constructor(
     }
 
     private fun stopTobaccoAnimations() {
+        statutoryQueueRunnable?.let { handler.removeCallbacks(it) }
+        statutoryQueueRunnable = null
+        statutoryHoldRunnable?.let { handler.removeCallbacks(it) }
+        statutoryHoldRunnable = null
         tobaccoEnterSet?.cancel()
         tobaccoEnterSet = null
         tobaccoExitSet?.cancel()
@@ -1350,6 +1450,7 @@ class MovyAdvisoryOverlay private constructor(
 
     private fun cleanupCard() {
         Log.i(TAG, "cleanupCard: overlay detached from window")
+        cancelPendingTimers()
         stopAnimations()
         stopTobaccoAnimations()
         card = null
@@ -1361,11 +1462,16 @@ class MovyAdvisoryOverlay private constructor(
         controlsVisible = false
         playbackRunning = false
         lastPosition = -1L
+        lastPositionAt = 0L
         lastEpisodeKey = null
+        completedEpisodeKey = null
         lastResolvedTitle = null
+        mainShowStartTimeMs = 0L
     }
 
     private fun detach() {
+        cancelPendingTimers()
+        handler.removeCallbacks(pollRunnable)
         val activeSession = session
         if (activeSession != null) handler.removeCallbacksAndMessages(activeSession)
         session = null
@@ -1377,8 +1483,11 @@ class MovyAdvisoryOverlay private constructor(
         controlsVisible = false
         playbackRunning = false
         lastPosition = -1L
+        lastPositionAt = 0L
         lastEpisodeKey = null
+        completedEpisodeKey = null
         lastResolvedTitle = null
+        mainShowStartTimeMs = 0L
         removeExistingCard()
     }
 
@@ -1535,7 +1644,7 @@ class MovyAdvisoryOverlay private constructor(
         }
 
         val tobaccoText = TextView(context).apply {
-            text = TOBACCO_WARNING_TEXT
+            text = statutoryWarningText ?: TOBACCO_WARNING_TEXT
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, tobaccoTextSp)
             typeface = Typeface.create("sans-serif", Typeface.BOLD)
@@ -1566,7 +1675,7 @@ class MovyAdvisoryOverlay private constructor(
             marginStart = dp(context, MASK_GAP_DP)
         })
 
-        tobaccoContainer.contentDescription = "Content advisory: $TOBACCO_WARNING_TEXT"
+        tobaccoContainer.contentDescription = "Content advisory: ${statutoryWarningText ?: TOBACCO_WARNING_TEXT}"
 
         root.addView(mainContainer, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
