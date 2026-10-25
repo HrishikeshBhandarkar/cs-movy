@@ -1827,7 +1827,39 @@ class MovyAdvisoryOverlay private constructor(
         data class MetadataResult(
             val ratingBadge: String,
             val descriptors: String,
-            val hasTobacco: Boolean
+            val hasTobacco: Boolean,
+            val hasAlcohol: Boolean = false,
+            val hasDrugs: Boolean = false,
+            val statutoryWarningText: String? = null
+        )
+
+        private data class OmdbData(
+            val imdbId: String?,
+            val rated: String?,
+            val genre: String?,
+            val plot: String?,
+            val hasTobacco: Boolean,
+            val hasAlcohol: Boolean,
+            val hasDrugs: Boolean
+        )
+
+        private data class TmdbData(
+            val imdbId: String?,
+            val ratingBadge: String?,
+            val keywords: List<String>,
+            val overview: String?,
+            val hasTobacco: Boolean,
+            val hasAlcohol: Boolean,
+            val hasDrugs: Boolean
+        )
+
+        private data class ParentsGuideData(
+            val descriptors: String?,
+            val hasTobacco: Boolean,
+            val hasAlcohol: Boolean,
+            val hasDrugs: Boolean,
+            val severeCount: Int,
+            val moderateCount: Int
         )
 
         fun fetch(
@@ -1848,21 +1880,79 @@ class MovyAdvisoryOverlay private constructor(
                 try {
                     val omdb = queryOmdb(clean, year)
                     val tmdb = queryTmdb(clean, year, isTv)
-                    val result = when {
-                        omdb != null && tmdb != null -> {
-                            val badge = omdb.ratingBadge
-                            val desc = if (tmdb.descriptors.isNotBlank()) tmdb.descriptors else omdb.descriptors
-                            val tobacco = omdb.hasTobacco || tmdb.hasTobacco
-                            MetadataResult(badge, desc, tobacco)
+                    val targetImdb = omdb?.imdbId ?: tmdb?.imdbId
+
+                    // 1. Query IMDb Parental Guide if IMDb ID is available
+                    val pg = targetImdb?.let { queryImdbParentsGuide(it) }
+
+                    // Rating badge resolution (OMDb preferred, TMDb localized fallback)
+                    val rawBadge = omdb?.rated ?: tmdb?.ratingBadge ?: if (isTv) "TV-14" else "PG-13"
+                    val ratingBadge = sanitizeRatingBadge(rawBadge)
+
+                    // Descriptors resolution rule:
+                    // 1. Pick IMDb Parental Guide categories >= MODERATE (with Severe > Moderate rule).
+                    // 2. If none are >= MODERATE, fallback to OMDb (IMDb) descriptors.
+                    // 3. If OMDb descriptors are empty, fallback to TMDb keywords.
+                    val descriptors: String
+                    if (pg != null && !pg.descriptors.isNullOrBlank()) {
+                        descriptors = pg.descriptors
+                        Log.i(TAG, "Descriptors from IMDb Parental Guide: $descriptors (severe=${pg.severeCount}, mod=${pg.moderateCount})")
+                    } else {
+                        val omdbDesc = omdb?.let { mapGenreAndPlotToDescriptors(it.genre.orEmpty(), it.plot.orEmpty(), ratingBadge) }
+                        if (!omdbDesc.isNullOrBlank()) {
+                            descriptors = omdbDesc
+                            Log.i(TAG, "Descriptors from OMDb (IMDb) Fallback: $descriptors")
+                        } else {
+                            val tmdbDesc = tmdb?.let { mapKeywordsToDescriptors(it.keywords, ratingBadge) }
+                            descriptors = if (!tmdbDesc.isNullOrBlank()) tmdbDesc else "fear, violence"
+                            Log.i(TAG, "Descriptors from TMDb Keywords Fallback: $descriptors")
                         }
-                        omdb != null -> omdb
-                        tmdb != null -> tmdb
+                    }
+
+                    // Statutory substance detection (Tobacco, Alcohol, Drugs)
+                    val textToScan = (
+                        descriptors + " " +
+                        omdb?.plot.orEmpty() + " " +
+                        tmdb?.overview.orEmpty() + " " +
+                        tmdb?.keywords?.joinToString(" ").orEmpty()
+                    ).lowercase()
+
+                    val hasTobacco = (pg?.hasTobacco == true) || (omdb?.hasTobacco == true) || (tmdb?.hasTobacco == true) ||
+                        textToScan.contains("tobacco") || textToScan.contains("smoking") ||
+                        textToScan.contains("cigarette") || textToScan.contains("cigar") || textToScan.contains("nicotine")
+
+                    val hasAlcohol = (pg?.hasAlcohol == true) || (omdb?.hasAlcohol == true) || (tmdb?.hasAlcohol == true) ||
+                        textToScan.contains("alcohol") || textToScan.contains("drinking") ||
+                        textToScan.contains("beer") || textToScan.contains("wine") || textToScan.contains("liquor") ||
+                        descriptors.contains("substances, alcohol, drugs") || descriptors.contains("alcohol")
+
+                    val hasDrugs = (pg?.hasDrugs == true) || (omdb?.hasDrugs == true) || (tmdb?.hasDrugs == true) ||
+                        textToScan.contains("drug") || textToScan.contains("substance") ||
+                        textToScan.contains("cocaine") || textToScan.contains("heroin") || textToScan.contains("marijuana") ||
+                        descriptors.contains("substances, alcohol, drugs") || descriptors.contains("substances")
+
+                    val hasAlcoholOrDrugs = hasAlcohol || hasDrugs
+
+                    val statutoryWarningText = when {
+                        hasTobacco && hasAlcoholOrDrugs -> "Consumption of tobacco & alcohol is injurious to health"
+                        hasAlcohol && hasDrugs -> "Consumption of alcohol & drugs is injurious to health"
+                        hasAlcohol -> "Consumption of alcohol is injurious to health"
+                        hasDrugs -> "Consumption of alcohol & drugs is injurious to health"
+                        hasTobacco -> "Consumption of tobacco products is injurious to health"
                         else -> null
                     }
-                    if (result != null) {
-                        cache[key] = result
-                        Handler(Looper.getMainLooper()).post { onResult(result) }
-                    }
+
+                    val result = MetadataResult(
+                        ratingBadge = ratingBadge,
+                        descriptors = descriptors,
+                        hasTobacco = hasTobacco,
+                        hasAlcohol = hasAlcohol,
+                        hasDrugs = hasDrugs,
+                        statutoryWarningText = statutoryWarningText
+                    )
+
+                    cache[key] = result
+                    Handler(Looper.getMainLooper()).post { onResult(result) }
                 } catch (t: Throwable) {
                     Log.d(TAG, "Rating fetch error: ${t.message}")
                 }
@@ -1876,7 +1966,104 @@ class MovyAdvisoryOverlay private constructor(
             .replace(Regex("""\((19|20)\d{2}\)"""), "")
             .trim()
 
-        private fun queryTmdb(title: String, year: Int?, isTv: Boolean): MetadataResult? {
+        private fun sanitizeRatingBadge(raw: String): String {
+            return raw.replace(Regex("""^Rated\s*""", RegexOption.IGNORE_CASE), "").trim().uppercase()
+        }
+
+        private fun extractImdbId(raw: String?): String? {
+            if (raw.isNullOrBlank()) return null
+            val match = Regex("""(tt\d{6,10})""").find(raw)
+            return match?.value
+        }
+
+        private fun queryImdbParentsGuide(imdbId: String): ParentsGuideData? {
+            val cleanId = extractImdbId(imdbId) ?: return null
+            val q = """{ title(id: "$cleanId") { id parentsGuide { categories { category { id text } severity { id } } } } }"""
+            val jsonPayload = JSONObject().apply { put("query", q) }.toString()
+            val respStr = httpPostJson("https://api.graphql.imdb.com/", jsonPayload, "https://www.imdb.com/") ?: return null
+
+            return try {
+                val root = JSONObject(respStr)
+                val cats = root.optJSONObject("data")?.optJSONObject("title")
+                    ?.optJSONObject("parentsGuide")?.optJSONArray("categories") ?: return null
+
+                val sevMap = mapOf(
+                    "severeVotes" to 3,
+                    "moderateVotes" to 2,
+                    "mildVotes" to 1,
+                    "noneVotes" to 0
+                )
+
+                val catMap = mapOf(
+                    "VIOLENCE" to "violence, gore",
+                    "PROFANITY" to "coarse language",
+                    "ALCOHOL" to "substances, alcohol, drugs",
+                    "FRIGHTENING" to "fear, intense scenes"
+                )
+
+                data class CatEntry(val id: String, val level: Int)
+                val entries = mutableListOf<CatEntry>()
+                var severeCount = 0
+                var moderateCount = 0
+                var hasAlcohol = false
+                var hasDrugs = false
+                var hasTobacco = false
+
+                for (i in 0 until cats.length()) {
+                    val c = cats.optJSONObject(i) ?: continue
+                    val cid = c.optJSONObject("category")?.optString("id").orEmpty()
+                    val sid = c.optJSONObject("severity")?.optString("id").orEmpty()
+                    val level = sevMap[sid] ?: 0
+                    if (level == 3) severeCount++
+                    else if (level == 2) moderateCount++
+
+                    if (cid == "ALCOHOL" && level >= 2) {
+                        hasAlcohol = true
+                        hasDrugs = true
+                    }
+                    entries.add(CatEntry(cid, level))
+                }
+
+                // Rule (User): If severe ratings are more in number than moderate, ignore moderate rating titles!
+                val selected = if (severeCount > moderateCount) {
+                    entries.filter { it.level == 3 }
+                } else {
+                    entries.filter { it.level >= 2 }
+                }
+
+                val descList = linkedSetOf<String>()
+                for (item in selected) {
+                    if (item.id == "NUDITY") {
+                        // Rule (User): if sex and nudity is in moderate display only nudity if in severe display both sex and nudity
+                        if (item.level == 3) {
+                            descList.add("sex, nudity")
+                        } else if (item.level == 2) {
+                            descList.add("nudity")
+                        }
+                    } else {
+                        val mapped = catMap[item.id]
+                        if (mapped != null) {
+                            descList.add(mapped)
+                        }
+                    }
+                }
+
+                val descriptors = if (descList.isNotEmpty()) descList.joinToString(", ") else null
+                ParentsGuideData(
+                    descriptors = descriptors,
+                    hasTobacco = hasTobacco,
+                    hasAlcohol = hasAlcohol,
+                    hasDrugs = hasDrugs,
+                    severeCount = severeCount,
+                    moderateCount = moderateCount
+                )
+            } catch (t: Throwable) {
+                Log.d(TAG, "queryImdbParentsGuide error: ${t.message}")
+                null
+            }
+        }
+
+        private fun queryTmdb(title: String, year: Int?, isTv: Boolean): TmdbData? {
             return try {
                 val encoded = URLEncoder.encode(title, "UTF-8")
                 val searchUrl = "https://db.wecollege.net/3/search/multi?query=$encoded"
@@ -1888,18 +2075,18 @@ class MovyAdvisoryOverlay private constructor(
                 val id = first.optInt("id", 0)
                 if (id == 0) return null
                 val mediaType = first.optString("media_type").ifBlank { if (isTv) "tv" else "movie" }
-                val overview = first.optString("overview", "").lowercase()
+                val overview = first.optString("overview", "")
+                val overviewLow = overview.lowercase()
 
                 var ratingBadge: String? = null
-                var hasTobacco = overview.contains("smoking") || overview.contains("tobacco") ||
-                    overview.contains("cigarette") || overview.contains("cigar")
-
+                var imdbId: String? = null
                 val keywordsList = mutableListOf<String>()
 
                 if (mediaType == "tv") {
-                    val detailJson = httpGet("https://db.wecollege.net/3/tv/$id?append_to_response=content_ratings,keywords")
+                    val detailJson = httpGet("https://db.wecollege.net/3/tv/$id?append_to_response=content_ratings,keywords,external_ids")
                     if (detailJson != null) {
                         val detailObj = JSONObject(detailJson)
+                        imdbId = detailObj.optJSONObject("external_ids")?.optString("imdb_id")?.trim()?.ifBlank { null }
                         val crResults = detailObj.optJSONObject("content_ratings")?.optJSONArray("results")
                         if (crResults != null) {
                             var inRating: String? = null
@@ -1927,9 +2114,10 @@ class MovyAdvisoryOverlay private constructor(
                         }
                     }
                 } else {
-                    val detailJson = httpGet("https://db.wecollege.net/3/movie/$id?append_to_response=release_dates,keywords")
+                    val detailJson = httpGet("https://db.wecollege.net/3/movie/$id?append_to_response=release_dates,keywords,external_ids")
                     if (detailJson != null) {
                         val detailObj = JSONObject(detailJson)
+                        imdbId = detailObj.optJSONObject("external_ids")?.optString("imdb_id")?.trim()?.ifBlank { null }
                         val relResults = detailObj.optJSONObject("release_dates")?.optJSONArray("results")
                         if (relResults != null) {
                             var inCert: String? = null
@@ -1962,21 +2150,21 @@ class MovyAdvisoryOverlay private constructor(
                     }
                 }
 
-                for (k in keywordsList) {
-                    if (k.contains("smoking") || k.contains("tobacco") || k.contains("cigarette") || k.contains("cigar")) {
-                        hasTobacco = true
-                    }
-                }
+                val kwText = (keywordsList.joinToString(" ") + " " + overviewLow).lowercase()
+                val hasTobacco = kwText.contains("smoking") || kwText.contains("tobacco") ||
+                    kwText.contains("cigarette") || kwText.contains("cigar")
+                val hasAlcohol = kwText.contains("alcohol") || kwText.contains("drinking") ||
+                    kwText.contains("beer") || kwText.contains("wine") || kwText.contains("liquor")
+                val hasDrugs = kwText.contains("drug") || kwText.contains("substance") ||
+                    kwText.contains("cocaine") || kwText.contains("heroin") || kwText.contains("marijuana")
 
-                if (ratingBadge.isNullOrBlank()) return null
-                val descriptors = mapKeywordsToDescriptors(keywordsList, ratingBadge)
-                MetadataResult(ratingBadge, descriptors, hasTobacco)
+                TmdbData(imdbId, ratingBadge, keywordsList, overview, hasTobacco, hasAlcohol, hasDrugs)
             } catch (t: Throwable) {
                 null
             }
         }
 
-        private fun queryOmdb(title: String, year: Int?): MetadataResult? {
+        private fun queryOmdb(title: String, year: Int?): OmdbData? {
             val encoded = URLEncoder.encode(title, "UTF-8")
             for (key in OMDB_API_KEYS) {
                 try {
@@ -1985,22 +2173,52 @@ class MovyAdvisoryOverlay private constructor(
                     val obj = JSONObject(jsonStr)
                     if (obj.optString("Response") != "True") continue
                     val rated = obj.optString("Rated").trim()
-                    if (rated.isBlank() || rated == "N/A" || rated.equals("Not Rated", ignoreCase = true)) continue
-
+                    val imdbId = obj.optString("imdbID").trim().ifBlank { null }
                     val genre = obj.optString("Genre", "")
-                    val plot = obj.optString("Plot", "").lowercase()
-                    val hasTobacco = plot.contains("smoking") || plot.contains("tobacco") ||
-                        plot.contains("cigarette") || plot.contains("cigar")
+                    val plot = obj.optString("Plot", "")
+                    val plotLow = plot.lowercase()
 
-                    val descriptors = mapGenreToDescriptors(genre, rated)
-                    return MetadataResult(rated, descriptors, hasTobacco)
+                    val hasTobacco = plotLow.contains("smoking") || plotLow.contains("tobacco") ||
+                        plotLow.contains("cigarette") || plotLow.contains("cigar")
+                    val hasAlcohol = plotLow.contains("alcohol") || plotLow.contains("drinking") ||
+                        plotLow.contains("beer") || plotLow.contains("wine") || plotLow.contains("liquor")
+                    val hasDrugs = plotLow.contains("drug") || plotLow.contains("substance") ||
+                        plotLow.contains("cocaine") || plotLow.contains("heroin") || plotLow.contains("marijuana")
+
+                    val validRated = if (rated.isBlank() || rated == "N/A" || rated.equals("Not Rated", ignoreCase = true)) null else rated
+                    return OmdbData(imdbId, validRated, genre, plot, hasTobacco, hasAlcohol, hasDrugs)
                 } catch (t: Throwable) { }
             }
             return null
         }
 
+        private fun mapGenreAndPlotToDescriptors(genre: String, plot: String, rating: String): String {
+            val found = linkedSetOf<String>()
+            val g = (genre + " " + plot).lowercase()
+            val isSevere = rating.contains("MA") || rating.contains("18") || rating.contains("R") || rating == "A"
+            if (g.contains("action") || g.contains("war") || g.contains("murder") || g.contains("kill") || g.contains("assassin")) found.add("violence")
+            if (g.contains("horror") || g.contains("thriller") || g.contains("monster") || g.contains("terror") || g.contains("creepy") || g.contains("suspense")) found.add("fear")
+            if (g.contains("crime") || g.contains("drug") || g.contains("substance") || g.contains("alcohol") || g.contains("cartel")) found.add("substances")
+            if (g.contains("comedy") || g.contains("language") || g.contains("profanity")) found.add("coarse language")
+            if (g.contains("sex") || g.contains("erotic") || g.contains("romance") || g.contains("nudity")) {
+                found.add(if (isSevere) "sex, nudity" else "nudity")
+            }
+            if (found.isEmpty()) {
+                if (isSevere) {
+                    found.add("violence")
+                    found.add("substances")
+                    found.add("coarse language")
+                } else {
+                    found.add("fear")
+                    found.add("mild violence")
+                }
+            }
+            return found.take(4).joinToString(", ")
+        }
+
         private fun mapKeywordsToDescriptors(keywords: List<String>, rating: String): String {
             val found = linkedSetOf<String>()
+            val isSevere = rating.contains("MA") || rating.contains("18") || rating.contains("R") || rating == "A"
             for (kw in keywords) {
                 when {
                     kw.contains("violence") || kw.contains("war") || kw.contains("fight") ||
@@ -2017,7 +2235,7 @@ class MovyAdvisoryOverlay private constructor(
                     kw.contains("profanity") || kw.contains("swearing") || kw.contains("language") ->
                         found.add("coarse language")
                     kw.contains("sex") || kw.contains("nudity") || kw.contains("erotic") ->
-                        found.add("sex, nudity")
+                        found.add(if (isSevere) "sex, nudity" else "nudity")
                     kw.contains("suicide") || kw.contains("self-harm") ->
                         found.add("suicide, self-harm")
                     kw.contains("gore") || kw.contains("bloody") ->
@@ -2027,7 +2245,7 @@ class MovyAdvisoryOverlay private constructor(
 
             if (found.size < 2) {
                 when {
-                    rating.contains("MA") || rating.contains("18") || rating.contains("R") || rating == "A" -> {
+                    isSevere -> {
                         found.add("violence")
                         found.add("substances")
                         found.add("coarse language")
@@ -2046,33 +2264,38 @@ class MovyAdvisoryOverlay private constructor(
             return found.take(4).joinToString(", ")
         }
 
-        private fun mapGenreToDescriptors(genre: String, rating: String): String {
-            val found = linkedSetOf<String>()
-            val g = genre.lowercase()
-            if (g.contains("action") || g.contains("crime") || g.contains("war")) found.add("violence")
-            if (g.contains("horror") || g.contains("thriller") || g.contains("mystery")) found.add("fear")
-            if (g.contains("crime") || g.contains("drama")) found.add("substances")
-            if (g.contains("comedy") || g.contains("drama")) found.add("language")
-            if (found.isEmpty()) {
-                if (rating.contains("18") || rating.contains("MA") || rating == "R" || rating == "A") {
-                    found.add("violence")
-                    found.add("substances")
-                    found.add("coarse language")
-                } else {
-                    found.add("fear")
-                    found.add("mild violence")
-                }
-            }
-            return found.take(4).joinToString(", ")
-        }
-
         private fun httpGet(urlStr: String): String? {
             return try {
                 val url = URL(urlStr)
                 val conn = url.openConnection() as HttpURLConnection
                 conn.connectTimeout = 4000
                 conn.readTimeout = 4000
-                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                if (conn.responseCode in 200..299) {
+                    BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
+                } else null
+            } catch (t: Throwable) {
+                null
+            }
+        }
+
+        private fun httpPostJson(urlStr: String, jsonBody: String, referer: String? = null): String? {
+            return try {
+                val url = URL(urlStr)
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.connectTimeout = 4000
+                conn.readTimeout = 4000
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                if (referer != null) {
+                    conn.setRequestProperty("Referer", referer)
+                }
+                conn.outputStream.use { os ->
+                    os.write(jsonBody.toByteArray(Charsets.UTF_8))
+                    os.flush()
+                }
                 if (conn.responseCode in 200..299) {
                     BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
                 } else null
