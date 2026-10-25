@@ -25,6 +25,7 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import android.util.Base64
 import android.util.Log
 import okhttp3.Interceptor
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
@@ -636,13 +637,25 @@ class NetMirrorProvider : MainAPI() {
         val item = array.optJSONObject(0) ?: return false
         val sources = item.optJSONArray("sources") ?: return false
 
+        val playToken = fetchPlayToken(loadData.id, cookies)
+
         var found = false
         val streamHeaders = streamRequestHeaders(cookies, "$mainUrl/")
         for (i in 0 until sources.length()) {
             val source = sources.optJSONObject(i) ?: continue
             val file = source.optString("file").takeIf { it.isNotBlank() } ?: continue
             val label = source.optString("label").ifBlank { "NetMirror" }
-            val url = if (file.startsWith("http")) file else "$mainUrl$file"
+            var url = if (file.startsWith("http")) file else "$mainUrl$file"
+
+            if (!playToken.isNullOrBlank()) {
+                url = if (url.contains("in=unknown::ni")) {
+                    url.replace("in=unknown::ni", playToken)
+                } else if (!url.contains("in=")) {
+                    if (url.contains("?")) "$url&$playToken" else "$url?$playToken"
+                } else {
+                    url
+                }
+            }
 
             callback.invoke(
                 newExtractorLink(
@@ -712,29 +725,123 @@ class NetMirrorProvider : MainAPI() {
 
 
 
+    private suspend fun fetchPlayToken(id: String, cookies: Map<String, String>): String? {
+        val userToken = cookies["user_token"] ?: NetMirrorStore.userToken()
+        val playHeaders = mutableMapOf(
+            "User-Agent" to DESKTOP_UA,
+            "Origin" to mainUrl,
+            "Referer" to "$mainUrl/",
+            "Content-Type" to "application/x-www-form-urlencoded",
+            "X-Requested-With" to "XMLHttpRequest"
+        )
+        val cookie = cookieHeader(cookies)
+        if (cookie.isNotBlank()) playHeaders["Cookie"] = cookie
+        userToken?.takeIf { it.isNotBlank() }?.let { playHeaders["Usertoken"] = it }
+
+        return runCatching {
+            val response = app.post(
+                "$mainUrl/play.php",
+                data = mapOf("id" to id),
+                headers = playHeaders,
+                cookies = cookies,
+                referer = "$mainUrl/"
+            )
+            val json = JSONObject(response.text)
+            val token = json.optString("h").takeIf { it.isNotBlank() }
+            Log.d(TAG, "NetMirror play.php id=$id returned token: $token")
+            token
+        }.onFailure {
+            Log.w(TAG, "NetMirror play.php failed for id=$id: ${it.message}")
+        }.getOrNull()
+    }
+
+    private fun sanitizeM3u8(manifest: String): String {
+        val lines = manifest.lines()
+        val result = mutableListOf<String>()
+        var strippedAudioGroup: String? = null
+
+        for (line in lines) {
+            val trimmed = line.trim()
+            // Drop broken audio tag with empty host (e.g. URI="https:///files/...")
+            if (trimmed.startsWith("#EXT-X-MEDIA:TYPE=AUDIO", ignoreCase = true)) {
+                val isBroken = trimmed.contains("https:///") || trimmed.contains("URI=\"\"")
+                if (isBroken) {
+                    val groupMatch = Regex("""GROUP-ID="([^"]+)"""").find(trimmed)
+                    strippedAudioGroup = groupMatch?.groupValues?.getOrNull(1) ?: "aac"
+                    Log.d(TAG, "Stripped malformed audio line from M3U8: $trimmed")
+                    continue
+                }
+            }
+
+            var fixed = line
+            // If audio group was stripped, remove the AUDIO="..." attribute from EXT-X-STREAM-INF
+            if (strippedAudioGroup != null && fixed.startsWith("#EXT-X-STREAM-INF", ignoreCase = true)) {
+                fixed = fixed.replace(Regex("""AUDIO="$strippedAudioGroup",?"""), "")
+            }
+
+            // Rewrite dead nm-cdn domains to working freecdn domain
+            if (fixed.contains("nm-cdn")) {
+                fixed = fixed.replace(Regex("""https://(s\d+)\.nm-cdn\d*\.top/"""), "https://$1.freecdn4.top/")
+                fixed = fixed.replace("nm-cdn4.top", "freecdn4.top")
+                fixed = fixed.replace("nm-cdn.top", "freecdn.top")
+                Log.d(TAG, "Rewrote nm-cdn line to: $fixed")
+            }
+
+            result.add(fixed)
+        }
+        return result.joinToString("\n")
+    }
+
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor? {
         return Interceptor { chain ->
             val request = chain.request()
             val host = request.url.host
             val builder = request.newBuilder()
-            extractorLink.referer?.takeIf { it.isNotBlank() }?.let {
-                builder.header("Referer", it)
+
+            val cookies = if (lastCookies.isNotEmpty()) lastCookies else currentCookies()
+            val userToken = cookies["user_token"] ?: NetMirrorStore.userToken()
+
+            val isCdn = host.contains("freecdn") || host.contains("nm-cdn")
+            if (isCdn) {
+                // FreeCDN strictly requires Referer: https://net52.cc/ and Origin: https://net52.cc
+                builder.header("Referer", CDN_REFERER)
+                builder.header("Origin", CDN_ORIGIN)
+                builder.header("User-Agent", DESKTOP_UA)
+            } else {
+                extractorLink.referer.takeIf { it.isNotBlank() }?.let {
+                    builder.header("Referer", it)
+                }
+                if (host.contains("net52") ||
+                    host.contains("net77") ||
+                    host.contains("subscdn") ||
+                    host.contains("imgcdn")
+                ) {
+                    builder.header("Origin", mainUrl)
+                    val cookie = cookieHeader(cookies)
+                    if (cookie.isNotBlank()) builder.header("Cookie", cookie)
+                    userToken?.takeIf { it.isNotBlank() }?.let { builder.header("Usertoken", it) }
+                }
             }
-            if (host.contains("net52") ||
-                host.contains("net77") ||
-                host.contains("freecdn") ||
-                host.contains("nm-cdn") ||
-                host.contains("subscdn") ||
-                host.contains("imgcdn")
-            ) {
-                builder.header("Origin", mainUrl)
-                val cookie = cookieHeader(lastCookies)
-                if (cookie.isNotBlank()) builder.header("Cookie", cookie)
-                (lastCookies["user_token"] ?: NetMirrorStore.userToken())?.takeIf {
-                    it.isNotBlank()
-                }?.let { builder.header("Usertoken", it) }
+
+            val response = chain.proceed(builder.build())
+
+            val isM3u8 = request.url.encodedPath.endsWith(".m3u8") ||
+                response.header("Content-Type")?.contains("mpegurl", ignoreCase = true) == true
+
+            if (isM3u8 && response.isSuccessful) {
+                val body = response.body
+                val rawBody = body.string()
+                if (rawBody.contains("#EXTM3U")) {
+                    val sanitized = sanitizeM3u8(rawBody)
+                    val newBody = sanitized.toResponseBody(body.contentType())
+                    return@Interceptor response.newBuilder().body(newBody).build()
+                } else {
+                    val restoredBody = rawBody.toResponseBody(body.contentType())
+                    return@Interceptor response.newBuilder().body(restoredBody).build()
+                }
             }
-            chain.proceed(builder.build())
+
+            response
         }
     }
 
@@ -759,6 +866,8 @@ class NetMirrorProvider : MainAPI() {
 
     companion object {
         private const val TAG = "NetMirrorProvider"
+        private const val CDN_REFERER = "https://net52.cc/"
+        private const val CDN_ORIGIN = "https://net52.cc"
         private const val SESSION_TTL_MS = 15L * 60L * 60L * 1000L
         private const val VERIFY_COOLDOWN_MS = 60L * 1000L
         private const val USER_AGENT =

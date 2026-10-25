@@ -24,6 +24,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import android.util.Log
+import okhttp3.Interceptor
 import org.json.JSONObject
 import java.net.URLEncoder
 
@@ -536,6 +537,18 @@ class MovyProvider : MainAPI() {
 
         Log.d(TAG, "final found=$foundSource netMirror=$netMirrorFound bingr=$bingrFound")
         return foundSource || netMirrorFound || bingrFound
+    }
+
+    override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor? {
+        if (extractorLink.source == netMirror.name ||
+            extractorLink.url.contains("net77") ||
+            extractorLink.url.contains("net52") ||
+            extractorLink.url.contains("freecdn") ||
+            extractorLink.url.contains("nm-cdn")
+        ) {
+            return netMirror.getVideoInterceptor(extractorLink)
+        }
+        return super.getVideoInterceptor(extractorLink)
     }
 
     private fun encodeComponent(value: String): String =

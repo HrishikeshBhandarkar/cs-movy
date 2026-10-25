@@ -28,8 +28,8 @@ import java.lang.ref.WeakReference
 
 object NetMirrorSettings {
     private const val VERIFY_URL = "https://net77.cc/verify.php"
-    private const val LOGIN_URL = "https://net77.cc/login"
-    private const val MOBILE_HOME = "https://net77.cc/mobile/home?app=1"
+    private const val LOGIN_URL = "https://net77.cc/"
+    private const val MOBILE_HOME = "https://net77.cc/home"
     private const val MOBILE_UA =
         "Mozilla/5.0 (Linux; Android 13; Pixel 5 Build/TQ3A.230901.001; wv) " +
             "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 " +
