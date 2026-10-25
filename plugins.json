@@ -1,0 +1,23 @@
+[
+    {
+        "iconUrl": "https://www.movy.sx/favicon.ico",
+        "fileHash": "sha256-abb8fb63dddee2b8d6a2994a28341ee779c8df8a60429a73a8a906e2b7f25c4a",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/HrishikeshBhandarkar/cs-movy",
+        "fileSize": 171333,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "HrishikeshBhandarkar"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 15,
+        "internalName": "MovyProvider",
+        "description": "Movies and TV series from movy.sx, NetMirror, and Bingr",
+        "url": "https://raw.githubusercontent.com/HrishikeshBhandarkar/cs-movy/builds/MovyProvider.cs3",
+        "name": "MovyProvider"
+    }
+]
