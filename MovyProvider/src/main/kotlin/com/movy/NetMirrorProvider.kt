@@ -43,14 +43,14 @@ class NetMirrorProvider : MainAPI() {
     override val mainPage = mainPageOf("" to "Home")
 
     private val headers = mapOf(
-        "User-Agent" to DESKTOP_UA,
+        "User-Agent" to USER_AGENT,
         "Accept" to "application/json, text/javascript, text/html, */*; q=0.01",
         "Accept-Language" to "en-IN,en-US;q=0.9,en;q=0.8",
         "X-Requested-With" to "XMLHttpRequest"
     )
 
     private val verifyHeaders = mapOf(
-        "User-Agent" to DESKTOP_UA,
+        "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language" to "en-US,en;q=0.9",
         "Origin" to "https://net77.cc",
@@ -74,12 +74,32 @@ class NetMirrorProvider : MainAPI() {
         return cookies
     }
 
+    private fun apiHeaders(
+        cookies: Map<String, String>,
+        referer: String = "$mainUrl/home"
+    ): Map<String, String> {
+        val result = mutableMapOf(
+            "User-Agent" to USER_AGENT,
+            "Accept" to "application/json, text/javascript, text/html, */*; q=0.01",
+            "Accept-Language" to "en-IN,en-US;q=0.9,en;q=0.8",
+            "X-Requested-With" to "XMLHttpRequest",
+            "Referer" to referer,
+            "Origin" to mainUrl
+        )
+        val cookie = cookieHeader(cookies)
+        if (cookie.isNotBlank()) result["Cookie"] = cookie
+        cookies["user_token"]?.takeIf { it.isNotBlank() }?.let {
+            result["Usertoken"] = it
+        }
+        return result
+    }
+
     private fun streamRequestHeaders(
         cookies: Map<String, String>,
         referer: String
     ): Map<String, String> {
         val result = mutableMapOf(
-            "User-Agent" to DESKTOP_UA,
+            "User-Agent" to USER_AGENT,
             "Accept" to "*/*",
             "Referer" to referer,
             "Origin" to mainUrl
@@ -135,10 +155,9 @@ class NetMirrorProvider : MainAPI() {
                 "hash=${savedToken?.length ?: 0}"
         )
 
-        // The 10-digit field inside t_hash_t is the creation time, not the
-        // expiry. Treating it as an expiry made every request mint a new token,
-        // which triggered NetMirror's anti-abuse block.
-        if (!savedToken.isNullOrBlank()) {
+        // If we have either a saved t_hash_t or a user_token from the user/webview,
+        // reuse it immediately. Running verify.php with fake recaptcha causes Cloudflare blocks.
+        if (!savedToken.isNullOrBlank() || !savedUserToken.isNullOrBlank()) {
             val cookies = saved.toMutableMap()
             cookies["ott"] = "nf"
             cookies["hd"] = "on"
@@ -201,23 +220,28 @@ class NetMirrorProvider : MainAPI() {
         var response = app.get(
             url,
             params = params,
-            headers = headers,
+            headers = apiHeaders(cookies, referer),
             cookies = cookies,
             referer = referer
         )
         var text = response.text
-        if (response.code == 403 || text.contains("/verify2") || text.contains("Just a moment")) {
+        if (response.code == 403 || text.contains("/verify2") || text.contains("Just a moment") || !text.trimStart().startsWith("{")) {
             cookies = session(force = true)
             response = app.get(
                 url,
                 params = params,
-                headers = headers,
+                headers = apiHeaders(cookies, referer),
                 cookies = cookies,
                 referer = referer
             )
             text = response.text
         }
-        return JSONObject(text)
+        val trimmed = text.trim()
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+            Log.w(TAG, "NetMirror getJson expected JSON but got: ${trimmed.take(120)}")
+            return JSONObject()
+        }
+        return JSONObject(trimmed)
     }
 
     private fun poster(id: String): String = "https://imgcdn.kim/poster/v/$id.jpg"
@@ -233,11 +257,12 @@ class NetMirrorProvider : MainAPI() {
         }
 
     private suspend fun homeDocument(): Document? {
+        val cookies = session()
         var response = runCatching {
             app.get(
                 "$mainUrl/home",
-                headers = headers,
-                cookies = session(),
+                headers = apiHeaders(cookies, "$mainUrl/"),
+                cookies = cookies,
                 referer = "$mainUrl/"
             )
         }.getOrNull() ?: return null
@@ -245,11 +270,12 @@ class NetMirrorProvider : MainAPI() {
             response.text.contains("/verify2") ||
             response.text.contains("Just a moment")
         ) {
+            val freshCookies = session(force = true)
             response = runCatching {
                 app.get(
                     "$mainUrl/home",
-                    headers = headers,
-                    cookies = session(force = true),
+                    headers = apiHeaders(freshCookies, "$mainUrl/"),
+                    cookies = freshCookies,
                     referer = "$mainUrl/"
                 )
             }.getOrNull() ?: return null
@@ -322,7 +348,9 @@ class NetMirrorProvider : MainAPI() {
         return results.firstOrNull {
             val candidate = normalizeTitle(it.name)
             candidate == wanted ||
-                candidate.removePrefix("the ").trim() == wanted.removePrefix("the ").trim()
+                candidate.removePrefix("the ").trim() == wanted.removePrefix("the ").trim() ||
+                candidate.startsWith(wanted) ||
+                wanted.startsWith(candidate)
         }
     }
 
@@ -542,12 +570,7 @@ class NetMirrorProvider : MainAPI() {
         lastCookies = cookies
 
         if (cookies["user_token"].isNullOrBlank()) {
-            NetMirrorSettings.showLogin(
-                "NetMirror needs a user_token before playback. Log in or play one ad, then save and retry."
-            )
-            throw ErrorLoadingException(
-                "NetMirror playback is locked. Finish the login popup, then retry."
-            )
+            Log.w(TAG, "NetMirror user_token is missing or blank; attempting playback")
         }
 
         val playToken = fetchPlayToken(loadData.id, cookies)
@@ -561,12 +584,7 @@ class NetMirrorProvider : MainAPI() {
             playlistParams["h"] = playToken
         }
 
-        val playlistHeaders = headers + mapOf(
-            "Origin" to mainUrl,
-            "Referer" to "$mainUrl/home",
-            "Cookie" to cookieHeader(cookies),
-            "Usertoken" to cookies["user_token"].orEmpty()
-        )
+        val playlistHeaders = apiHeaders(cookies, "$mainUrl/home")
         var playlistResponse = runCatching {
             app.get(
                 "$mainUrl/playlist.php",
@@ -578,19 +596,14 @@ class NetMirrorProvider : MainAPI() {
         }.getOrNull() ?: return false
 
         var playlist = playlistResponse.text
-        if (playlistResponse.code == 403 || playlist.contains("/verify2")) {
+        if (playlistResponse.code == 403 || playlist.contains("/verify2") || playlist.contains("Just a moment")) {
             cookies = session(force = true)
             lastCookies = cookies
             playlistResponse = runCatching {
                 app.get(
                     "$mainUrl/playlist.php",
                     params = playlistParams,
-                    headers = headers + mapOf(
-                        "Origin" to mainUrl,
-                        "Referer" to "$mainUrl/home",
-                        "Cookie" to cookieHeader(cookies),
-                        "Usertoken" to cookies["user_token"].orEmpty()
-                    ),
+                    headers = apiHeaders(cookies, "$mainUrl/home"),
                     cookies = cookies,
                     referer = "$mainUrl/home"
                 )
@@ -609,9 +622,9 @@ class NetMirrorProvider : MainAPI() {
             playlist.contains("Just a moment")
         ) {
             NetMirrorSettings.showLogin(
-                "Your NetMirror session expired. Log in again to unlock playback."
+                "NetMirror session expired or Cloudflare challenge active. Please log in, then retry."
             )
-            throw ErrorLoadingException("NetMirror session expired. Complete the login popup, then retry.")
+            return false
         }
 
         var array = runCatching { JSONArray(playlist) }.getOrNull()
@@ -623,12 +636,7 @@ class NetMirrorProvider : MainAPI() {
                 app.get(
                     "$mainUrl/playlist.php",
                     params = playlistParams,
-                    headers = headers + mapOf(
-                        "Origin" to mainUrl,
-                        "Referer" to "$mainUrl/home",
-                        "Cookie" to cookieHeader(cookies),
-                        "Usertoken" to cookies["user_token"].orEmpty()
-                    ),
+                    headers = apiHeaders(cookies, "$mainUrl/home"),
                     cookies = cookies,
                     referer = "$mainUrl/home"
                 ).text
@@ -637,108 +645,74 @@ class NetMirrorProvider : MainAPI() {
         }
 
         if (array == null || array.length() == 0) {
-            NetMirrorSettings.showLogin(
-                "Your NetMirror session expired. Log in again to unlock playback."
-            )
-            throw ErrorLoadingException("NetMirror session expired. Complete the login popup, then retry.")
+            Log.w(TAG, "NetMirror playlist is empty or invalid JSON: $playlist")
+            return false
         }
 
         val item = array.optJSONObject(0) ?: return false
         val sources = item.optJSONArray("sources") ?: return false
 
-        var found = false
         val streamHeaders = streamRequestHeaders(cookies, "$mainUrl/home")
+        val validSources = mutableListOf<Pair<JSONObject, String>>()
 
         for (i in 0 until sources.length()) {
             val source = sources.optJSONObject(i) ?: continue
             val file = source.optString("file").takeIf { it.isNotBlank() } ?: continue
-            val label = source.optString("label").ifBlank { "NetMirror" }
-            var hlsUrl = if (file.startsWith("http")) file else "$mainUrl$file"
+            var url = if (file.startsWith("http")) file else "$mainUrl$file"
 
             if (!playToken.isNullOrBlank()) {
-                hlsUrl = if (hlsUrl.contains("in=unknown::ni")) {
-                    hlsUrl.replace("in=unknown::ni", playToken)
-                } else if (!hlsUrl.contains("in=")) {
-                    if (hlsUrl.contains("?")) "$hlsUrl&$playToken" else "$hlsUrl?$playToken"
+                url = if (url.contains("in=unknown::ni")) {
+                    url.replace("in=unknown::ni", playToken)
+                } else if (!url.contains("in=")) {
+                    if (url.contains("?")) "$url&$playToken" else "$url?$playToken"
                 } else {
-                    hlsUrl
+                    url
                 }
             }
 
-            // Fetch the HLS master manifest server-side so our cookies are applied correctly.
-            // This ensures net77.cc sees the user's valid session and returns real CDN URLs
-            // instead of the 220884 abuse placeholder video.
-            val manifestText = runCatching {
-                app.get(
-                    hlsUrl,
-                    headers = streamHeaders,
-                    cookies = cookies,
-                    referer = "$mainUrl/home"
-                ).text
-            }.getOrNull()
+            validSources.add(source to url)
+        }
 
-            if (manifestText != null && manifestText.contains("#EXTM3U")) {
-                // Parse CDN stream URLs from the master manifest and register them directly.
-                // This bypasses ExoPlayer auth issues since the CDN URLs carry their own tokens.
-                val sanitized = sanitizeM3u8(manifestText)
-                val cdnLinks = parseCdnLinksFromManifest(sanitized, label)
-                if (cdnLinks.isNotEmpty()) {
-                    if (sanitized.contains("/220884/")) {
-                        Log.w(TAG, "NetMirror returned abuse video 220884 for $hlsUrl — session may be expired or content unavailable")
-                    }
-                    for ((cdnUrl, cdnQuality, cdnLabel) in cdnLinks) {
-                        callback.invoke(
-                            newExtractorLink(
-                                source = name,
-                                name = if (cdnLabel == "Auto") name else "$name $cdnLabel",
-                                url = cdnUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = CDN_REFERER
-                                this.quality = cdnQuality
-                                this.headers = mapOf(
-                                    "User-Agent" to DESKTOP_UA,
-                                    "Referer" to CDN_REFERER,
-                                    "Origin" to CDN_ORIGIN
-                                )
-                            }
-                        )
-                        found = true
-                    }
-                } else {
-                    // Manifest had no parseable CDN URLs (may be a single-rendition HLS) —
-                    // fall back to registering the sanitized net77 URL directly.
-                    callback.invoke(
-                        newExtractorLink(
-                            source = name,
-                            name = if (label == "Auto") name else "$name $label",
-                            url = hlsUrl,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = "$mainUrl/home"
-                            this.quality = qualityOf(label)
-                            this.headers = streamHeaders
-                        }
-                    )
-                    found = true
+        if (validSources.isEmpty()) return false
+
+        // Guard against NetMirror's 220884 punishment / honeypot video.
+        // If NetMirror serves 220884, it means the IP / session lacks a verified user_token or ad postback.
+        // Rejecting here prevents ExoPlayer from playing the 10-minute abuse loop and allows
+        // MovyProvider to fall through to other mirrors (Bingr, etc.).
+        val probeUrl = validSources.first().second
+        val probe = runCatching {
+            app.get(
+                probeUrl,
+                headers = streamHeaders,
+                cookies = cookies,
+                referer = "$mainUrl/home"
+            ).text
+        }.getOrNull().orEmpty()
+
+        if (probe.contains("/220884/") || probe.contains("Only Valid Users Allowed", ignoreCase = true)) {
+            Log.w(TAG, "NetMirror served abuse punishment video 220884; rejecting stream to allow fallback")
+            NetMirrorSettings.showLogin(
+                "NetMirror requires a valid user_token (punishment video 220884 detected). Please log in or paste user_token."
+            )
+            return false
+        }
+
+        var found = false
+        for ((source, url) in validSources) {
+            val label = source.optString("label").ifBlank { "NetMirror" }
+            callback.invoke(
+                newExtractorLink(
+                    source = name,
+                    name = if (label == "Auto") name else "$name $label",
+                    url = url,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "$mainUrl/home"
+                    this.quality = qualityOf(label)
+                    this.headers = streamHeaders
                 }
-            } else {
-                // Could not fetch manifest — register the URL and let ExoPlayer try via interceptor
-                Log.w(TAG, "NetMirror failed to fetch manifest for $hlsUrl; registering raw URL")
-                callback.invoke(
-                    newExtractorLink(
-                        source = name,
-                        name = if (label == "Auto") name else "$name $label",
-                        url = hlsUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "$mainUrl/home"
-                        this.quality = qualityOf(label)
-                        this.headers = streamHeaders
-                    }
-                )
-                found = true
-            }
+            )
+            found = true
         }
 
         val tracks = item.optJSONArray("tracks")
@@ -795,17 +769,9 @@ class NetMirrorProvider : MainAPI() {
 
 
     private suspend fun fetchPlayToken(id: String, cookies: Map<String, String>): String? {
-        val userToken = cookies["user_token"] ?: NetMirrorStore.userToken()
-        val playHeaders = mutableMapOf(
-            "User-Agent" to DESKTOP_UA,
-            "Origin" to mainUrl,
-            "Referer" to "$mainUrl/home",
-            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With" to "XMLHttpRequest"
+        val playHeaders = apiHeaders(cookies, "$mainUrl/home") + mapOf(
+            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8"
         )
-        val cookie = cookieHeader(cookies)
-        if (cookie.isNotBlank()) playHeaders["Cookie"] = cookie
-        userToken?.takeIf { it.isNotBlank() }?.let { playHeaders["Usertoken"] = it }
 
         return runCatching {
             val response = app.post(
@@ -822,50 +788,6 @@ class NetMirrorProvider : MainAPI() {
         }.onFailure {
             Log.w(TAG, "NetMirror play.php failed for id=$id: ${it.message}")
         }.getOrNull()
-    }
-
-    /**
-     * Parse the absolute CDN stream URLs from a (sanitized) HLS master manifest.
-     * Returns a list of (url, quality, label) triples — one per EXT-X-STREAM-INF variant.
-     */
-    private fun parseCdnLinksFromManifest(
-        manifest: String,
-        fallbackLabel: String
-    ): List<Triple<String, Int, String>> {
-        val result = mutableListOf<Triple<String, Int, String>>()
-        val lines = manifest.lines()
-        var streamInfLine: String? = null
-        for (line in lines) {
-            val trimmed = line.trim()
-            if (trimmed.startsWith("#EXT-X-STREAM-INF", ignoreCase = true)) {
-                streamInfLine = trimmed
-                continue
-            }
-            if (streamInfLine != null && trimmed.isNotBlank() && !trimmed.startsWith("#")) {
-                // URI line following an EXT-X-STREAM-INF tag
-                val url = if (trimmed.startsWith("http")) trimmed else null
-                if (url != null) {
-                    val height = Regex("""RESOLUTION=\d+x(\d+)""", RegexOption.IGNORE_CASE)
-                        .find(streamInfLine)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                    val quality = when {
-                        height != null && height >= 2160 -> Qualities.P2160.value
-                        height != null && height >= 1080 -> Qualities.P1080.value
-                        height != null && height >= 720  -> Qualities.P720.value
-                        height != null && height >= 480  -> Qualities.P480.value
-                        height != null && height >= 360  -> Qualities.P360.value
-                        else -> qualityOf(fallbackLabel)
-                    }
-                    val labelSuffix = if (height != null) "${height}p" else fallbackLabel
-                    result.add(Triple(url, quality, "NetMirror $labelSuffix"))
-                }
-                streamInfLine = null
-            } else if (trimmed.startsWith("#") &&
-                !trimmed.startsWith("#EXT-X-STREAM-INF", ignoreCase = true)
-            ) {
-                streamInfLine = null
-            }
-        }
-        return result
     }
 
     private fun sanitizeM3u8(manifest: String): String {
@@ -920,7 +842,7 @@ class NetMirrorProvider : MainAPI() {
                 // FreeCDN strictly requires Referer: https://net52.cc/ and Origin: https://net52.cc
                 builder.header("Referer", CDN_REFERER)
                 builder.header("Origin", CDN_ORIGIN)
-                builder.header("User-Agent", DESKTOP_UA)
+                builder.header("User-Agent", USER_AGENT)
             } else {
                 extractorLink.referer.takeIf { it.isNotBlank() }?.let {
                     builder.header("Referer", it)
@@ -931,7 +853,7 @@ class NetMirrorProvider : MainAPI() {
                     host.contains("imgcdn")
                 ) {
                     builder.header("Origin", mainUrl)
-                    builder.header("User-Agent", DESKTOP_UA)
+                    builder.header("User-Agent", USER_AGENT)
                 }
             }
 

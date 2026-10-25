@@ -7,17 +7,17 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class MovyPlugin : Plugin() {
     override fun load(context: Context) {
-        NetMirrorStore.init(context)
-        NetMirrorSettings.init(context)
-        MovyAdvisoryOverlay.install(context)
-        NetMirrorStatusOverlay.install(context)
+        runCatching { NetMirrorStore.init(context) }
+        runCatching { NetMirrorSettings.init(context) }
+        runCatching { MovyAdvisoryOverlay.install(context) }
+        runCatching { NetMirrorStatusOverlay.install(context) }
         registerMainAPI(MovyProvider())
         registerMainAPI(NetMirrorProvider())
         openSettings = { ctx -> NetMirrorSettings.show(ctx) }
     }
 
     override fun beforeUnload() {
-        NetMirrorStatusOverlay.release()
-        MovyAdvisoryOverlay.release()
+        runCatching { NetMirrorStatusOverlay.release() }
+        runCatching { MovyAdvisoryOverlay.release() }
     }
 }
