@@ -648,12 +648,11 @@ class NetMirrorProvider : MainAPI() {
 
         var found = false
         val streamHeaders = streamRequestHeaders(cookies, "$mainUrl/home")
-        val validSources = mutableListOf<Pair<JSONObject, String>>()
-        var punishment = false
 
         for (i in 0 until sources.length()) {
             val source = sources.optJSONObject(i) ?: continue
             val file = source.optString("file").takeIf { it.isNotBlank() } ?: continue
+            val label = source.optString("label").ifBlank { "NetMirror" }
             var url = if (file.startsWith("http")) file else "$mainUrl$file"
 
             if (!playToken.isNullOrBlank()) {
@@ -666,41 +665,6 @@ class NetMirrorProvider : MainAPI() {
                 }
             }
 
-            val probeManifest = runCatching {
-                app.get(
-                    url,
-                    headers = streamHeaders,
-                    cookies = cookies,
-                    referer = "$mainUrl/home"
-                ).text
-            }.getOrNull().orEmpty()
-
-            if (probeManifest.contains("/220884/") ||
-                probeManifest.contains("Only Valid Users Allowed", ignoreCase = true)
-            ) {
-                Log.w(TAG, "NetMirror served abuse punishment video 220884 for $url")
-                punishment = true
-                continue
-            }
-
-            validSources.add(source to url)
-        }
-
-        if (validSources.isEmpty()) {
-            if (punishment) {
-                Log.w(TAG, "NetMirror served only abuse punishment video 220884; rejecting stream")
-                NetMirrorSettings.showLogin(
-                    "NetMirror session expired or locked (abuse video 220884). Please log in or paste a fresh user_token, then retry."
-                )
-                throw ErrorLoadingException(
-                    "NetMirror session expired or locked. Complete the login popup, then retry."
-                )
-            }
-            return false
-        }
-
-        for ((source, url) in validSources) {
-            val label = source.optString("label").ifBlank { "NetMirror" }
             callback.invoke(
                 newExtractorLink(
                     source = name,
@@ -799,17 +763,10 @@ class NetMirrorProvider : MainAPI() {
         }.getOrNull()
     }
 
-    private fun sanitizeM3u8(manifest: String): String {
+    private fun sanitizeM3u8(manifest: String, mediaId: String? = null): String {
         val lines = manifest.lines()
         val result = mutableListOf<String>()
         var strippedAudioGroup: String? = null
-
-        if (manifest.contains("/220884/") || manifest.contains("Only Valid Users Allowed", ignoreCase = true)) {
-            Log.w(TAG, "NetMirror served abuse punishment video 220884 in M3U8")
-            NetMirrorSettings.showLogin(
-                "NetMirror session expired or locked (abuse 220884). Please log in or paste a fresh user_token, then retry."
-            )
-        }
 
         for (line in lines) {
             val trimmed = line.trim()
@@ -836,6 +793,12 @@ class NetMirrorProvider : MainAPI() {
                 fixed = fixed.replace("nm-cdn4.top", "freecdn4.top")
                 fixed = fixed.replace("nm-cdn.top", "freecdn.top")
                 Log.d(TAG, "Rewrote nm-cdn line to: $fixed")
+            }
+
+            // Rewrite abuse punishment video 220884 to the requested media ID
+            if (!mediaId.isNullOrBlank() && fixed.contains("/files/220884/")) {
+                fixed = fixed.replace("/files/220884/", "/files/$mediaId/")
+                Log.d(TAG, "Rewrote abuse video 220884 to real media ID: $mediaId")
             }
 
             result.add(fixed)
@@ -890,7 +853,9 @@ class NetMirrorProvider : MainAPI() {
                 val body = response.body
                 val rawBody = body.string()
                 if (rawBody.contains("#EXTM3U")) {
-                    val sanitized = sanitizeM3u8(rawBody)
+                    val mediaId = Regex("""/hls/(\d+)\.m3u8""").find(extractorLink.url)?.groupValues?.getOrNull(1)
+                        ?: Regex("""/files/(\d+)/""").find(extractorLink.url)?.groupValues?.getOrNull(1)
+                    val sanitized = sanitizeM3u8(rawBody, mediaId)
                     val newBody = sanitized.toResponseBody(body.contentType())
                     return@Interceptor response.newBuilder().body(newBody).build()
                 } else {
