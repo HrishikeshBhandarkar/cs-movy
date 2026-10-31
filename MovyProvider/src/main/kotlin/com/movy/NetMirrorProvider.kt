@@ -675,26 +675,27 @@ class NetMirrorProvider : MainAPI() {
 
         if (validSources.isEmpty()) return false
 
-        // Guard against NetMirror's 220884 punishment / honeypot video.
-        // If NetMirror serves 220884, it means the IP / session lacks a verified user_token or ad postback.
-        // Rejecting here prevents ExoPlayer from playing the 10-minute abuse loop and allows
-        // MovyProvider to fall through to other mirrors (Bingr, etc.).
+        // Probe for NetMirror's 220884 punishment / honeypot video.
+        // If detected, warn the user but still add the links so NetMirror
+        // shows up as a source — the user can log in later for real streams.
         val probeUrl = validSources.first().second
-        val probe = runCatching {
-            app.get(
+        val isPunishment = runCatching {
+            val probeText = app.get(
                 probeUrl,
                 headers = streamHeaders,
                 cookies = cookies,
                 referer = "$mainUrl/home"
             ).text
-        }.getOrNull().orEmpty()
+            probeText.contains("/220884/") || probeText.contains("Only Valid Users Allowed", ignoreCase = true)
+        }.getOrDefault(false)
 
-        if (probe.contains("/220884/") || probe.contains("Only Valid Users Allowed", ignoreCase = true)) {
-            Log.w(TAG, "NetMirror served abuse punishment video 220884; rejecting stream to allow fallback")
-            NetMirrorSettings.showLogin(
-                "NetMirror requires a valid user_token (punishment video 220884 detected). Please log in or paste user_token."
-            )
-            return false
+        if (isPunishment) {
+            Log.w(TAG, "NetMirror served punishment video 220884; links still added but session is invalid")
+            runCatching {
+                NetMirrorSettings.showLogin(
+                    "NetMirror session expired or missing. Log in for real streams."
+                )
+            }
         }
 
         var found = false
